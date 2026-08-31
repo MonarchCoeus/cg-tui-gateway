@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""CG — Coeus Gateway. Local OpenAI-compatible LLM gateway.
+
+Usage:
+  cg serve [--port N] [--config PATH]     run the gateway
+  cg tui   [--config PATH]                provider manager (curses)
+  cg add NAME URL KEY [KEY...] [--round-robin]
+  cg list                                 providers + models
+  cg detect NAME                          re-list models (cheap, no probes)
+  cg inspect NAME MODEL                   probe one model: reasoning/vision/availability
+  cg status                               query a running gateway
+  cg revive [NAME]                        un-kill keys a 401/403 marked dead
+"""
+
+import argparse
+import os
+import sys
+
+# realpath, not abspath: this script is normally reached through a symlink
+# (~/.local/bin/GC), and abspath would leave us in the symlink's directory
+# where the cgw package doesn't exist.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from cgw import config as C  # noqa: E402
+from cgw import detect as D  # noqa: E402
+from cgw import http as H  # noqa: E402
+
+
+def cmd_serve(args):
+    from cgw.server import serve
+
+    httpd, state = serve(args.config, args.host, args.port)
+    host, port = httpd.server_address[0], httpd.server_address[1]
+    n = sum(len(p.get("models") or {}) for p in state.providers())
+    print("CG listening on http://%s:%d  (%d providers, %d models)"
+          % (host, port, len(state.providers()), n))
+    print("no inbound auth — loopback only. Ctrl-C to stop.")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopping")
+        httpd.shutdown()
+
+
+def _cap(val):
+    """Tri-state: yes / no / not yet checked."""
+    if val is True:
+        return "yes"
+    if val is False:
+        return "no"
+    return "?"
+
+
+def cmd_tui(args):
+    from cgw import tui
+
+    tui.main(args.config)
+
+
+def cmd_add(args):
+    cfg = C.load(args.config)
+    if C.find(cfg, args.name):
+        print("provider %r already exists" % args.name)
+        return 1
+    rotation = "round_robin" if args.round_robin else "fill_first"
+    p = C.new_provider(args.name, args.url, args.keys, rotation)
+    print("detecting %s ..." % args.url)
+    res = D.discover(args.url, args.keys[0])
+    p["flavor"] = res["flavor"]
+    p["base_url"] = res["base_url"]
+    p["models"] = C.merge_models(p.get("models"), res["models"])
+    cfg["providers"].append(p)
+    C.save(cfg, args.config)
+    print("flavor: %s   base: %s   %s" % (res["flavor"], res["base_url"], res["note"]))
+    if not res["models"]:
+        print("no models found — add them by hand in the TUI ('m') if the provider blocks /models")
+        return 0
+    print("%d models" % len(res["models"]))
+    print("run 'cg inspect %s MODEL' (or ENTER in the TUI) to probe reasoning/vision for real." % args.name)
+    return 0
+
+
+def cmd_inspect(args):
+    cfg = C.load(args.config)
+    p = C.find(cfg, args.name)
+    if not p:
+        print("no such provider: %s" % args.name)
+        return 1
+    keys = [k["key"] for k in p["keys"] if k.get("enabled", True)]
+    if not keys:
+        print("no enabled keys")
+        return 1
+    res = D.inspect_model(p["base_url"], args.model, keys[0], p.get("flavor", "openai"),
+                          listing_item=D.stated_facts((p.get("models") or {}).get(args.model)),
+                          progress=lambda stage: print("  probing %s ..." % stage))
+    entry = D.merge_inspection((p.get("models") or {}).get(args.model), res)
+    p.setdefault("models", {})[args.model] = entry
+    C.save(cfg, args.config)
+
+    def yn(v):
+        return "yes" if v is True else ("no" if v is False else "unknown")
+
+    print("")
+    print("%-10s %s" % ("model", args.model))
+    print("%-10s %s — %s" % ("reasoning", yn(res["reasoning"]), res["reasoning_note"]))
+    print("%-10s %s — %s" % ("vision", yn(res["vision"]), res["vision_note"]))
+    print("%-10s %s — %s" % ("available", yn(res.get("available")), res.get("available_note", "")))
+    return 0
+
+
+def cmd_detect(args):
+    cfg = C.load(args.config)
+    p = C.find(cfg, args.name)
+    if not p:
+        print("no such provider: %s" % args.name)
+        return 1
+    keys = [k["key"] for k in p["keys"] if k.get("enabled", True)]
+    if not keys:
+        print("no enabled keys")
+        return 1
+    res = D.discover(p["base_url"], keys[0],
+                     flavor=None if p["flavor"] == "unknown" else p["flavor"])
+    p["flavor"], p["base_url"] = res["flavor"], res["base_url"]
+    p["models"] = C.merge_models(p.get("models"), res["models"])
+    C.save(cfg, args.config)
+    print("%s: %s (%s), %d models" % (p["name"], res["note"], res["flavor"], len(p["models"])))
+    return 0
+
+
+def _ctx(val):
+    """Human-readable context size: '200k' / '1.5M' / '-' when unset."""
+    if val is None:
+        return "-"
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return "-"
+    if n >= 1_000_000:
+        return "%gM" % (n / 1_000_000)
+    if n >= 1000:
+        return "%gk" % round(n / 1000)
+    return str(n)
+
+
+def cmd_list(args):
+    cfg = C.load(args.config)
+    if not cfg["providers"]:
+        print("no providers. add one:  cg add NAME URL KEY")
+        return 0
+    for p in cfg["providers"]:
+        print("%s %s  %s  %s  %d keys  %s" % (
+            "*" if p.get("enabled", True) else "-", p["name"], p["base_url"],
+            p["flavor"], len(p["keys"]), p["rotation"].replace("_", "-")))
+        print("    %-40s %-4s %-4s %-4s %-6s" % ("model", "rsn", "vis", "avail", "ctx"))
+        for mid, meta in sorted((p.get("models") or {}).items()):
+            rsn = _cap(meta.get("reasoning"))
+            vis = _cap(meta.get("vision"))
+            avail = _cap(meta.get("available"))
+            ctx = _ctx(meta.get("context"))
+            print("    %-40s %-4s %-4s %-4s %-6s" % (mid, rsn, vis, avail, ctx))
+    return 0
+
+
+def cmd_status(args):
+    cfg = C.load(args.config)
+    listen = cfg.get("listen") or {}
+    host = args.host or listen.get("host", "127.0.0.1")
+    port = args.port or listen.get("port", C.DEFAULT_PORT)
+    url = "http://%s:%s/healthz" % (host, port)
+    r = H.get(url, timeout=5)
+    if not r.ok:
+        print("gateway not reachable at %s (%s)" % (url, r.status or r.error))
+        return 1
+    data = r.json() or {}
+    for p in data.get("providers", []):
+        keys = " ".join("%s=%s" % (k["label"], k["status"]) for k in p["keys"])
+        print("%-14s %-10s %-12s %3d models  %s"
+              % (p["name"], p["flavor"], p["rotation"].replace("_", "-"), p["models"], keys))
+    return 0
+
+
+def cmd_revive(args):
+    cfg = C.load(args.config)
+    listen = cfg.get("listen") or {}
+    host = args.host or listen.get("host", "127.0.0.1")
+    port = args.port or listen.get("port", C.DEFAULT_PORT)
+    url = "http://%s:%s/v1/revive" % (host, port)
+    r = H.post(url, {"provider": args.name} if args.name else {}, timeout=5)
+    if not r.ok:
+        print("gateway not reachable at %s (%s)" % (url, r.status or r.error))
+        return 1
+    data = r.json() or {}
+    print("revived %s (%d ring(s))" % (data.get("provider", "all"), data.get("revived", 0)))
+    return 0
+
+
+def _parse_tokens(s):
+    """Accept '128000', '128k', '1m'. Returns int or None if unparseable."""
+    s = (s or "").strip().lower().replace("_", "")
+    if not s:
+        return None
+    mult = 1
+    if s.endswith("k"):
+        mult, s = 1000, s[:-1]
+    elif s.endswith("m"):
+        mult, s = 1_000_000, s[:-1]
+    try:
+        n = float(s)
+    except ValueError:
+        return None
+    if n <= 0:
+        return None
+    return int(n * mult)
+
+
+def cmd_toggle(args):
+    cfg = C.load(args.config)
+    p = C.find(cfg, args.name)
+    if not p:
+        print("no such provider: %s" % args.name)
+        return 1
+    if args.state is None:
+        p["enabled"] = not p.get("enabled", True)
+    else:
+        p["enabled"] = args.state == "on"
+    C.save(cfg, args.config)
+    print("%s is now %s" % (p["name"], "enabled" if p["enabled"] else "disabled"))
+    return 0
+
+
+def cmd_context(args):
+    cfg = C.load(args.config)
+    p = C.find(cfg, args.name)
+    if not p:
+        print("no such provider: %s" % args.name)
+        return 1
+    mid = args.model
+    meta = (p.get("models") or {}).get(mid)
+    if args.tokens is None:
+        # query mode — don't create an entry
+        if meta is None:
+            print("%s/%s: no context set" % (args.name, mid))
+        else:
+            cur = meta.get("context")
+            src = meta.get("context_source")
+            if cur is None:
+                print("%s/%s: no context set" % (args.name, mid))
+            else:
+                label = "listing" if src == "listing" else "manual"
+                print("%s/%s: %s tokens (%s)" % (args.name, mid, _ctx(cur), label))
+        return 0
+    if meta is None:
+        # a model that hasn't been detected yet can still get a context override
+        p.setdefault("models", {})[mid] = {}
+        meta = p["models"][mid]
+    if args.tokens == "clear":
+        meta.pop("context", None)
+        meta.pop("context_source", None)
+        print("%s/%s: manual context cleared" % (args.name, mid))
+    else:
+        n = _parse_tokens(args.tokens)
+        if n is None:
+            print("invalid context size: %r (use e.g. 128000, 128k, 1m)" % args.tokens)
+            return 1
+        meta["context"] = n
+        meta["context_source"] = "manual"
+        print("%s/%s: context set to %s tokens" % (args.name, mid, _ctx(n)))
+    C.save(cfg, args.config)
+    return 0
+
+
+# Fields a probe (or a provider listing) wrote about a model. A reset drops
+# these plus any manual context override. Listing context (from the provider)
+# is kept — that's provider data, not a user choice.
+PROBED_FIELDS = ("reasoning", "reasoning_note", "vision", "vision_note",
+                 "available", "available_note", "checked")
+
+
+def cmd_reset(args):
+    """Forget every probed capability verdict for one model.
+
+    The model entry is left in place (the provider still lists it), but
+    reasoning/vision/availability and their evidence notes go back to '-'
+    so the next inspect starts from a clean slate. A manually-set context
+    override is also dropped; a context that came from the provider's
+    listing survives.
+    """
+    cfg = C.load(args.config)
+    p = C.find(cfg, args.name)
+    if not p:
+        print("no such provider: %s" % args.name)
+        return 1
+    meta = (p.get("models") or {}).get(args.model)
+    if meta is None:
+        print("%s/%s: no saved values to reset" % (args.name, args.model))
+        return 0
+    for field in PROBED_FIELDS:
+        meta.pop(field, None)
+    if meta.get("context_source") == "manual":
+        meta.pop("context", None)
+        meta.pop("context_source", None)
+    C.save(cfg, args.config)
+    print("%s/%s: probed values reset (reasoning/vision/availability)" % (args.name, args.model))
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="cg", description="Coeus Gateway")
+    ap.add_argument("--config", default=None, help="config path (default ~/.config/cg/config.json)")
+    sub = ap.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("serve")
+    s.add_argument("--host", default=None)
+    s.add_argument("--port", type=int, default=None)
+    s.set_defaults(fn=cmd_serve)
+
+    sub.add_parser("tui").set_defaults(fn=cmd_tui)
+
+    a = sub.add_parser("add")
+    a.add_argument("name")
+    a.add_argument("url")
+    a.add_argument("keys", nargs="+")
+    a.add_argument("--round-robin", action="store_true")
+    a.set_defaults(fn=cmd_add)
+
+    ins = sub.add_parser("inspect")
+    ins.add_argument("name")
+    ins.add_argument("model")
+    ins.set_defaults(fn=cmd_inspect)
+
+    d = sub.add_parser("detect")
+    d.add_argument("name")
+    d.set_defaults(fn=cmd_detect)
+
+    sub.add_parser("list").set_defaults(fn=cmd_list)
+    st = sub.add_parser("status")
+    st.add_argument("--host", default=None)
+    st.add_argument("--port", type=int, default=None)
+    st.set_defaults(fn=cmd_status)
+
+    rv = sub.add_parser("revive", help="clear dead/cooldown key state on a running gateway")
+    rv.add_argument("name", nargs="?", default=None, help="provider (default: all)")
+    rv.add_argument("--host", default=None)
+    rv.add_argument("--port", type=int, default=None)
+    rv.set_defaults(fn=cmd_revive)
+
+    tg = sub.add_parser("toggle", help="enable/disable a provider")
+    tg.add_argument("name")
+    tg.add_argument("state", nargs="?", choices=["on", "off"], default=None,
+                    help="'on'/'off', or omit to flip")
+    tg.set_defaults(fn=cmd_toggle)
+
+    cx = sub.add_parser("context", help="set/clear/show a model's context window (manual override)")
+    cx.add_argument("name")
+    cx.add_argument("model")
+    cx.add_argument("tokens", nargs="?", default=None,
+                    help="size like 128000/128k/1m, or 'clear' to remove; omit to show")
+    cx.set_defaults(fn=cmd_context)
+
+    rs = sub.add_parser("reset", help="forget a model's probed capability verdicts")
+    rs.add_argument("name")
+    rs.add_argument("model")
+    rs.set_defaults(fn=cmd_reset)
+
+    args = ap.parse_args(argv)
+    if not getattr(args, "fn", None):
+        args.fn = cmd_tui
+        args.cmd = "tui"
+    try:
+        return args.fn(args) or 0
+    except C.ConfigError as e:
+        # a corrupt config must never be silently replaced by an empty one
+        print("config error: %s" % e, file=sys.stderr)
+        print("fix or move the file; CG will not overwrite it.", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
