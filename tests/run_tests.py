@@ -46,6 +46,7 @@ def tearDownModule():
 
 
 class TestConfig(unittest.TestCase):
+    @unittest.skipUnless(os.name != "nt", "POSIX permissions: no-op on Windows")
     def test_roundtrip_and_permissions(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "config.json")
