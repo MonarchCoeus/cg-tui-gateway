@@ -16,6 +16,8 @@ import argparse
 import os
 import sys
 
+VERSION = "1.0.0"
+
 # realpath, not abspath: this script is normally reached through a symlink
 # (~/.local/bin/GC), and abspath would leave us in the symlink's directory
 # where the cgw package doesn't exist.
@@ -306,6 +308,7 @@ def cmd_reset(args):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="cg", description="Coeus Gateway")
+    ap.add_argument("--version", action="version", version="CG %s" % VERSION)
     ap.add_argument("--config", default=None, help="config path (default ~/.config/cg/config.json)")
     sub = ap.add_subparsers(dest="cmd")
 
