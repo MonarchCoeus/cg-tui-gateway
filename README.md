@@ -12,14 +12,24 @@ Point Hermes (or anything OpenAI-compatible) at `http://127.0.0.1:20185/v1`.
 
 ## Install
 
+One-liner for newbies — the latest release tarball, no git needed:
+
+    curl -fsSL https://github.com/MonarchCoeus/cg-tui-gateway/releases/latest/download/install.sh | bash
+
+Windows (PowerShell):
+
+    irm https://github.com/MonarchCoeus/cg-tui-gateway/releases/latest/download/install.ps1 | iex
+
+The installers put CG under `~/.local/share/cg-tui-gateway` (Linux/macOS) or
+`%LOCALAPPDATA%\cg-tui-gateway` (Windows), symlink/link a `cg` command on your
+PATH, and check your Python (3.9+ required). Nothing else to install: no pip
+packages, no database, no cloud.
+
+Developers can also clone the repo itself:
+
     git clone https://github.com/MonarchCoeus/cg-tui-gateway.git
     cd cg-tui-gateway
     ./cg                    # launches the TUI (or: ./cg serve)
-
-Nothing to install — Python 3.9+ standard library only: no pip packages, no
-database, no cloud. Optional: put it on your PATH once.
-
-    ln -s "$PWD/cg" ~/.local/bin/cg
 
 ## Quick start
 
