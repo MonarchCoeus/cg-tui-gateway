@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest an idea for CG
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does it solve?
+      description: The user story, not the solution.
+      placeholder: "As a ..., I want to ... so that ..."
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What should change? Rough sketches welcome.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered

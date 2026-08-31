@@ -1,0 +1,54 @@
+name: Bug report
+description: Something isn't working as expected
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! ⚠️ **Never include API keys or secrets** in this
+        form — mask anything that looks like a key or credential.
+  - type: input
+    id: version
+    attributes:
+      label: CG version
+      description: Output of `cg --version`, or the release tag you installed.
+      placeholder: "e.g. 1.0.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Platform
+      description: OS and how you run CG (terminal / install method).
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What did you do? Include the exact commands.
+      placeholder: |
+        1. cg add demo https://example.com/v1 sk-...
+        2. cg serve
+        3. call http://127.0.0.1:20185/v1/chat/completions with ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Paste the error output — mask anything that looks like a key.
+    validations:
+      required: true

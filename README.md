@@ -243,3 +243,7 @@ and two with broken keys.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Changelog
+
+See [CHANGELOG](CHANGELOG.md).
