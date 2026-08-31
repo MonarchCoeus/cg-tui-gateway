@@ -13,16 +13,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: build artifacts
         run: |
-          mkdir -p dist
+          mkdir -p dist work
           git archive --format=tar.gz --prefix=cg-tui-gateway/ -o dist/cg-tui-gateway.tar.gz HEAD
-          tar -C dist -xzf dist/cg-tui-gateway.tar.gz
-          (cd dist && zip -qr cg-tui-gateway.zip cg-tui-gateway)
+          tar -C work -xzf dist/cg-tui-gateway.tar.gz
+          (cd work && zip -qr ../dist/cg-tui-gateway.zip cg-tui-gateway)
           cp scripts/install.sh scripts/install.ps1 dist/
       - name: publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          gh release create "$GITHUB_REF_NAME" \
+            dist/cg-tui-gateway.tar.gz dist/cg-tui-gateway.zip \
+            dist/install.sh dist/install.ps1 \
             --title "CG $GITHUB_REF_NAME" \
             --notes "Installer one-liners (Linux/macOS):
             \`\`\`bash
