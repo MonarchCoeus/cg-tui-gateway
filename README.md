@@ -47,6 +47,13 @@ sizes and then serve the guess as fact. CG does one job: rotate keys across
 providers and tell the truth about what it knows — and **not** pretend to know
 what it doesn't.
 
+## Screenshots
+
+<table>
+<tr><td><img src="docs/screenshots/tui-light.png" alt="CG TUI light theme"><br><em>Light theme</em></td>
+<td><img src="docs/screenshots/tui-dark.png" alt="CG TUI dark theme"><br><em>Dark theme — the selection bar tints itself to the terminal's real background</em></td></tr>
+</table>
+
 ## Requirements
 
 Python 3.9+ standard library. That's it. Nothing to install.
