@@ -190,6 +190,14 @@ def openai_to_anthropic(body):
     elif body.get("thinking") and isinstance(body.get("thinking"), dict):
         # pass through an already-anthropic-shaped thinking config
         out["thinking"] = body["thinking"]
+    # Anthropic rejects budget_tokens >= max_tokens outright. A small
+    # max_tokens (clients probing cheaply, or the 4096 default above) used
+    # to make every reasoning request a 400, so lift the cap instead.
+    think = out.get("thinking")
+    if isinstance(think, dict) and think.get("type") == "enabled":
+        budget = think.get("budget_tokens") or 0
+        if budget >= out["max_tokens"]:
+            out["max_tokens"] = budget + 1024
     return out
 
 

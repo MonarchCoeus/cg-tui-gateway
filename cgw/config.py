@@ -189,6 +189,11 @@ def normalize(cfg):
             # per-model enable flag survives load/save round-trips
             if meta.get("enabled") is not None:
                 entry["enabled"] = bool(meta["enabled"])
+            # 'manual' marks hand-added models; merge_models relies on it to
+            # keep them when the provider's listing doesn't include them.
+            # Dropping it here silently deleted manual models on re-listing.
+            if meta.get("source") is not None:
+                entry["source"] = meta["source"]
             models[mid] = entry
         q["models"] = models
         provs.append(q)

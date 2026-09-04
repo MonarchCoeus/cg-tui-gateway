@@ -156,6 +156,26 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(p["rotation"], "fill_first")
         self.assertEqual(p["flavor"], "unknown")
 
+    def test_normalize_keeps_manual_source(self):
+        """'source: manual' must survive a load/save round-trip: merge_models
+        uses it to keep hand-added models when a re-listing omits them, so
+        dropping it on normalize silently deleted those models."""
+        cfg = C.normalize({"providers": [{
+            "name": "x", "base_url": "http://y", "keys": ["a"],
+            "models": {"hand": {"source": "manual"},
+                       "hand-off": {"source": "manual", "enabled": False}},
+        }]})
+        m = cfg["providers"][0]["models"]
+        self.assertEqual(m["hand"].get("source"), "manual")
+        self.assertEqual(m["hand-off"].get("source"), "manual")
+        # and a full save/load round-trip keeps it too
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "config.json")
+            C.save(cfg, path)
+            self.assertEqual(
+                C.load(path)["providers"][0]["models"]["hand"].get("source"),
+                "manual")
+
     def test_as_int_none_default_returns_none_not_raises(self):
         """The TUI context prompt feeds '1M' -> as_int('1m', None); it must
         return None (so the k/m suffix parser takes over), not raise. This
@@ -856,6 +876,23 @@ class TestTranslate(unittest.TestCase):
         self.assertEqual(out["system"], "be nice")
         self.assertEqual(out["messages"], [{"role": "user", "content": "hi"}])
         self.assertIn("max_tokens", out)
+
+    def test_thinking_budget_never_meets_max_tokens(self):
+        """Anthropic 400s when budget_tokens >= max_tokens; the translator
+        must lift the cap so reasoning requests on small budgets still go."""
+        out = T.openai_to_anthropic({"model": "m", "reasoning_effort": "high",
+                                     "max_tokens": 50, "messages": [
+                                         {"role": "user", "content": "hi"}]})
+        self.assertEqual(out["thinking"]["budget_tokens"], 4096)
+        self.assertGreater(out["max_tokens"], out["thinking"]["budget_tokens"])
+        # the 4096 default cap hits the same wall without an explicit max
+        out2 = T.openai_to_anthropic({"model": "m", "reasoning_effort": "max",
+                                      "messages": [{"role": "user", "content": "hi"}]})
+        self.assertGreater(out2["max_tokens"], out2["thinking"]["budget_tokens"])
+        # no thinking requested: cap untouched
+        out3 = T.openai_to_anthropic({"model": "m", "max_tokens": 50, "messages": [
+            {"role": "user", "content": "hi"}]})
+        self.assertEqual(out3["max_tokens"], 50)
 
     def test_consecutive_roles_merged(self):
         out = T.openai_to_anthropic({"model": "m", "messages": [
