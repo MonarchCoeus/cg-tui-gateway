@@ -75,6 +75,10 @@ Python 3.9+ standard library. That's it. Nothing to install.
     ./cg reset NAME MODEL            discard a model's probed verdicts
     ./cg serve [--host H] [--port N] run the gateway
     ./cg status                      key health from a running gateway
+    ./cg stats [--window W] [--days N] [--by model|provider]
+                                     token usage: in/out, cache hits
+                                     W = 15min..30d or session (this run)
+    ./cg stats --session ID          usage during one Hermes session
     ./cg tui                         interactive manager (also the default)
 
 Every command takes `--config PATH` if you want a config other than
@@ -91,18 +95,25 @@ gateway picks them up on the next request — no restart needed.
 
     a  add provider          x  reset a model's probed verdicts
     e  edit provider         m  add a model by hand
-    d  delete provider       /  filter models
+    d  delete provider       /  find-as-you-type (ESC clears)
     K  edit keys             A  probe availability for all models
     r  re-detect             R  revive dead/benched keys
     t  enable/disable        l  open a live log terminal (new window)
     T  toggle all models     ?  full keymap overlay
+    u  usage for the selection (time windows or Hermes sessions)
     j/k  move      ENTER  inspect the highlighted model
     c  set/clear its context window      tab  switch pane
     q  quit
+    F5 (or ctrl+R)  reload config from disk, re-check gateway
 
 The `l` key spawns your terminal emulator running `scripts/logwatch.sh`, which
 polls the gateway's `/v1/logs` (see below) every second and shows the last
 requests with the key that served each one — a running proof of rotation.
+
+Every successful request also records token counts (in / out / cached) to
+`~/.config/cg/usage.jsonl`, one JSON line each, capped so the file cannot
+grow forever. `cg stats` summarizes it per model or provider over the last
+N days; upstreams that report no counts show as n/a, never zero.
 
 The selection bar is a tint of the accent blue blended over the terminal's
 real background (queried via OSC 11), so it reads as the same blue as the
@@ -214,7 +225,7 @@ first.
     POST /v1/completions
     POST /v1/embeddings
     GET  /healthz               providers, key health, rotation
-    GET  /v1/logs?n=20          recent per-request log (model, key, status, ms)
+    GET  /v1/logs?n=20          recent per-request log (model, key, status, ms, pin/pout/cached)
     POST /v1/revive             clear dead/cooldown key state
 
 ## Tests

@@ -91,7 +91,14 @@ def looks_faked(payload, flavor="openai"):
         return True
     rid = str(payload.get("id") or "")
     usage = payload.get("usage") or {}
-    spent = sum(int(usage.get(k) or 0) for k in
+
+    def _spent(val):
+        try:
+            return int(val or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    spent = sum(_spent(usage.get(k)) for k in
                 ("total_tokens", "completion_tokens", "prompt_tokens",
                  "input_tokens", "output_tokens"))
     return "fake" in rid.lower() and spent == 0
@@ -212,7 +219,9 @@ def capability_from_fields(obj, which):
         if name in obj and isinstance(obj[name], bool):
             return obj[name]
     modalities = obj.get("input_modalities") or obj.get("modalities")
-    if which == "vision" and isinstance(modalities, list):
+    if which == "vision" and isinstance(modalities, list) and modalities:
+        # an empty list states nothing (unlike ["text"]); only a non-empty
+        # list is a verdict, so [] stays None (unknown) instead of False
         return any(str(m).lower() in ("image", "vision") for m in modalities)
     return None
 
@@ -427,16 +436,74 @@ def hf_config_facts(model_id, timeout=20):
 
     out = {}
     arch = " ".join(cfg.get("architectures") or [])
-    has_vision = bool(cfg.get("vision_config") or cfg.get("image_token_index")
-                      or cfg.get("vision_tower") or "VL" in arch
-                      or "Vision" in arch or "ForConditionalGeneration" in arch)
-    out["vision"] = has_vision
+    out["vision"] = _arch_has_vision(arch, cfg)
     out["arch"] = arch or None
     return out
 
 
+def _arch_has_vision(arch, cfg):
+    """Config-shape hint, no tokens spent. Explicit vision fields win; the
+    architecture-name fallback matches vision families only — never bare
+    conditional-generation names (T5/BART-style text models live there)."""
+    if "vision_config" in cfg or "image_token_index" in cfg or "vision_tower" in cfg:
+        return True
+    return "VL" in arch or "Vision" in arch
+
+
+def _responses_text(payload):
+    """Assistant text out of an OpenAI Responses-API object, or ''."""
+    if not isinstance(payload, dict):
+        return ""
+    chunks = []
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if isinstance(part, dict) and part.get("type") in ("output_text", "text"):
+                if isinstance(part.get("text"), str):
+                    chunks.append(part["text"])
+    return "".join(chunks)
+
+
+def _responses_fallback(base, model_id, key, timeout):
+    """One minimal /responses call. Returns (True, note, 'responses') or None.
+
+    Some providers serve models ONLY on the Responses endpoint (opencode
+    Zen's Muse Spark 500s on /chat/completions but answers /responses).
+    Only a real answer counts; anything else leaves the chat verdict alone.
+    """
+    try:
+        r = H.post(base.rstrip("/") + "/responses",
+                   {"model": model_id, "input": "ping"},
+                   H.openai_auth(key), timeout=timeout)
+    except Exception:
+        return None
+    if r.ok:
+        payload = r.json()
+        if isinstance(payload, dict):
+            err = payload.get("error")
+            if isinstance(err, dict) and err:
+                return None
+            if _responses_text(payload) or payload.get("status") == "completed":
+                return True, "answered via /responses (responses-only endpoint)", "responses"
+        return None
+    if _account_problem(r):
+        return None
+    return None
+
+
 def probe_availability(base, model_id, key, flavor, timeout=30, retries=1):
-    """One minimal chat call: does this model answer at all?
+    """One minimal chat call: does this model answer at all?"""
+    verdict, note, _ = probe_availability_full(base, model_id, key, flavor, timeout, retries)
+    return verdict, note
+
+
+def probe_availability_full(base, model_id, key, flavor, timeout=30, retries=1):
+    """Like probe_availability, plus WHICH endpoint answered as third value.
+
+    Third value is 'responses' when the model only answers the OpenAI
+    Responses endpoint, else None. probe_availability() keeps the old
+    2-tuple for its existing callers.
 
     Cheap enough to always run first (~1 token): a dead or misrouted model
     fails here in one request instead of burning a reasoning probe and a
@@ -457,26 +524,100 @@ def probe_availability(base, model_id, key, flavor, timeout=30, retries=1):
         if r.ok:
             payload = r.json() or {}
             if looks_faked(payload, flavor):
-                return None, "provider returned a quota notice, not the model"
+                return None, "provider returned a quota notice, not the model", None
             msg = _error_in_200(payload)
             if msg:
-                return False, "provider errored inside an HTTP 200: %s" % msg
-            return True, "answered a minimal request"
+                return False, "provider errored inside an HTTP 200: %s" % msg, None
+            return True, "answered a minimal request", None
         if _account_problem(r):
-            return None, "account error (%s) — cannot tell" % (r.status or r.error)
+            return None, "account error (%s) — cannot tell" % (r.status or r.error), None
         text = _error_text(r)
         if r.status == 404 or re.search(r"not found|no such model|does not exist", text, re.I):
-            return False, "%s: %s" % (r.status, text[:70])
+            hit = _responses_fallback(base, model_id, key, timeout)
+            if hit:
+                return hit
+            return False, "%s: %s" % (r.status, text[:70]), None
         if not r.status and "timed out" not in (r.error or "").lower():
             # refused / no route: the provider itself is down, and every
             # capability probe would fail the same way — skip them
-            return False, "provider unreachable (%s)" % (r.error or "connection")[:70]
+            hit = _responses_fallback(base, model_id, key, timeout)
+            if hit:
+                return hit
+            return False, "provider unreachable (%s)" % (r.error or "connection")[:70], None
         last = "%s: %s" % (r.status or "timeout", text[:70])
     # slow answers after retries: flaky, not proven dead
-    return None, "no answer after %d tries (%s) — inconclusive" % (retries + 1, last)
+    hit = _responses_fallback(base, model_id, key, timeout)
+    if hit:
+        return hit
+    return None, "no answer after %d tries (%s) — inconclusive" % (retries + 1, last), None
 
 
-def probe_reasoning(base, model_id, key, flavor, timeout=90, fast=False):
+def _responses_url(base):
+    return base.rstrip("/") + "/responses"
+
+
+def _responses_reasoning_trace(payload):
+    """Visible reasoning trace text from a Responses object, or ''.
+
+    Some providers (opencode Zen) encrypt the trace: the reasoning block
+    completes but carries no readable text. That is still proof a
+    reasoning pass ran — just not a quotable trace.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    chunks = []
+    for item in payload.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            continue
+        for summ in item.get("summary") or []:
+            if isinstance(summ, dict) and isinstance(summ.get("text"), str):
+                chunks.append(summ["text"])
+    return "".join(chunks)
+
+
+def _responses_reasoned(payload):
+    """True when a Responses object carries a completed reasoning block."""
+    if not isinstance(payload, dict):
+        return False
+    return any(isinstance(i, dict) and i.get("type") == "reasoning"
+               and i.get("status") in ("completed", None)
+               for i in payload.get("output") or [])
+
+
+def _probe_reasoning_responses(base, model_id, key, timeout, fast):
+    """Reasoning probe through the Responses API (responses-only models)."""
+    url, auth = _responses_url(base), H.openai_auth(key)
+    ask = "What is 17*23? Think step by step."
+    r = H.post(url, {"model": model_id, "input": ask, "max_output_tokens": 1024},
+               auth, timeout=timeout)
+    if not r.ok:
+        if _account_problem(r):
+            return None, "account error (%s)" % (r.status or r.error)
+        return None, "error %s: %s" % (r.status or r.error, _error_text(r)[:80])
+    payload = r.json() or {}
+    err = payload.get("error")
+    if isinstance(err, dict) and err:
+        return None, "provider errored: %s" % str(err.get("message") or err)[:80]
+    trace = _responses_reasoning_trace(payload)
+    if trace:
+        note = "reasons (fast: %d chars of trace)" % len(trace)
+    elif not _responses_reasoned(payload):
+        return False, "no reasoning block even when asked to think"
+    else:
+        note = "reasons (trace encrypted, block completed)"
+    if fast:
+        return True, note
+    r2 = H.post(url, {"model": model_id, "input": "What is 17*23?",
+                      "max_output_tokens": 1024}, auth, timeout=timeout)
+    if r2.ok:
+        p2 = r2.json() or {}
+        if _responses_reasoned(p2) or _responses_reasoning_trace(p2):
+            return True, "always reasons (block present without asking too)"
+        return True, "reasons on request (%s)" % note
+    return True, note
+
+
+def probe_reasoning(base, model_id, key, flavor, timeout=90, fast=False, endpoint=None):
     """Does this model emit a reasoning trace? Evidence-based.
 
     Asks with reasoning enabled and requires a non-empty trace in the reply.
@@ -484,7 +625,12 @@ def probe_reasoning(base, model_id, key, flavor, timeout=90, fast=False):
     only when asked" from "always reasons, can't be turned off" — the
     latter breaks JSON-mode consumers, so it's worth naming. `fast=True`
     skips that confirm call (one request instead of two).
+
+    endpoint='responses' runs the same test through the Responses API for
+    models served only there.
     """
+    if endpoint == "responses":
+        return _probe_reasoning_responses(base, model_id, key, timeout, fast)
     url, auth = _chat_url(base, flavor), _auth(key, flavor)
     # A trivial greeting lets a thinking model skip its trace entirely, so the
     # prompt asks for something small that still needs a step or two.
@@ -538,7 +684,54 @@ def probe_reasoning(base, model_id, key, flavor, timeout=90, fast=False):
     return True, "returned a %d-char reasoning trace" % len(trace)
 
 
-def probe_vision(base, model_id, key, flavor, timeout=120, fast=False):
+def _probe_vision_responses(base, model_id, key, timeout):
+    """Token-differential vision test through the Responses API."""
+    url, auth = _responses_url(base), H.openai_auth(key)
+    prompt = "Describe what you see."
+    img_url = "data:image/png;base64," + base64.b64encode(_png(512, 512)).decode()
+
+    def send(with_image):
+        parts = [{"type": "input_text", "text": prompt}]
+        if with_image:
+            parts.append({"type": "input_image", "image_url": img_url})
+        return H.post(url, {"model": model_id, "max_output_tokens": 64,
+                            "input": [{"role": "user", "content": parts}]},
+                      auth, timeout=timeout)
+
+    results = {}
+    def call(which, with_image):
+        results[which] = send(with_image)
+    t_img = threading.Thread(target=call, args=("img", True))
+    t_txt = threading.Thread(target=call, args=("txt", False))
+    t_img.start()
+    t_txt.start()
+    t_img.join()
+    t_txt.join()
+    r_img, r_txt = results["img"], results["txt"]
+
+    if not r_img.ok:
+        if _account_problem(r_img):
+            return None, "account error (%s)" % (r_img.status or r_img.error)
+        text = _error_text(r_img)
+        if VISION_REFUSAL.search(text):
+            return False, "refused image input: %s" % text[:70]
+        return None, "error %s: %s" % (r_img.status or r_img.error, text[:70])
+    if not r_txt.ok:
+        return None, "image call succeeded but the text baseline failed (%s)" % (
+            r_txt.status or r_txt.error)
+    img_pt = ((r_img.json() or {}).get("usage") or {}).get("input_tokens")
+    txt_pt = ((r_txt.json() or {}).get("usage") or {}).get("input_tokens")
+    if img_pt is None or txt_pt is None:
+        return None, "no usage counts returned — cannot prove the image was read"
+    delta = img_pt - txt_pt
+    if delta > VISION_TOKEN_FLOOR:
+        return True, "image cost %d extra input tokens (via /responses)" % delta
+    if delta > 0:
+        return False, "image moved input tokens by %d only — silently dropped" % delta
+    return False, "image cost zero tokens — silently dropped"
+
+
+def probe_vision(base, model_id, key, flavor, timeout=120, fast=False, endpoint=None):
     """Does the model actually ingest images? Token-differential test.
 
     A no-error response proves nothing: several vLLM gateways accept an
@@ -556,7 +749,12 @@ def probe_vision(base, model_id, key, flavor, timeout=120, fast=False):
     compatibility but does NOT shortcut the differential: there is no
     single-call way to distinguish real vision from a silent drop, and
     claiming "yes" from a bare 200 was a false positive on real providers.
+
+    endpoint='responses' runs the same differential through the Responses
+    API for models served only there.
     """
+    if endpoint == "responses":
+        return _probe_vision_responses(base, model_id, key, timeout)
     url, auth = _chat_url(base, flavor), _auth(key, flavor)
     prompt = "Describe what you see."
     img = _png(512, 512)
@@ -580,7 +778,10 @@ def probe_vision(base, model_id, key, flavor, timeout=120, fast=False):
     # (This is also the ONLY honest vision test — see the docstring.)
     results = {}
     def call(which, parts):
-        results[which] = send(parts)
+        try:
+            results[which] = send(parts)
+        except Exception as e:  # noqa: BLE001 - a dead thread must read as
+            results[which] = H.Resp(0, b"", {}, error=repr(e))  # inconclusive, never KeyError
     t_img = threading.Thread(target=call, args=("img", [text_part, img_part]))
     t_txt = threading.Thread(target=call, args=("txt", [text_part]))
     t_img.start()
@@ -639,6 +840,11 @@ def merge_inspection(meta, res):
     if res.get("available") is not None:
         entry["available"] = res["available"]
         entry["available_note"] = res["available_note"]
+    if "endpoint" in res:
+        if res["endpoint"]:
+            entry["endpoint"] = res["endpoint"]
+        else:
+            entry.pop("endpoint", None)
     return entry
 
 
@@ -674,7 +880,8 @@ def inspect_model(base, model_id, key, flavor, listing_item=None,
     out = {"model": model_id, "flavor": flavor}
 
     step("availability")
-    out["available"], out["available_note"] = probe_availability(base, model_id, key, flavor)
+    out["available"], out["available_note"], out["endpoint"] = probe_availability_full(
+        base, model_id, key, flavor)
 
     stated = {}
     for which in ("reasoning", "vision"):
@@ -702,11 +909,12 @@ def inspect_model(base, model_id, key, flavor, listing_item=None,
         try:
             if which == "reasoning":
                 out[which], out["%s_note" % which] = probe_reasoning(
-                    base, model_id, key, flavor, fast=True)
+                    base, model_id, key, flavor, fast=True,
+                    endpoint=out.get("endpoint"))
             else:
                 # vision has NO fast path: a bare 200 can't prove ingestion
                 out[which], out["%s_note" % which] = probe_vision(
-                    base, model_id, key, flavor)
+                    base, model_id, key, flavor, endpoint=out.get("endpoint"))
         except Exception as e:  # noqa: BLE001 — a probe must never kill inspect
             out[which], out["%s_note" % which] = None, "probe crashed: %s" % e
 

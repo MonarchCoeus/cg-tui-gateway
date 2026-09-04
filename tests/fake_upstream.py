@@ -87,7 +87,7 @@ class Fake(BaseHTTPRequestHandler):
                                                   "max_context_length": 200000}]})
             if mode in ("bare", "sibling", "errctx", "flaky", "deadkey",
                         "thinker", "faker", "seer", "emptyreason", "err200",
-                        "cheapseer"):
+                        "cheapseer", "respondent"):
                 if not self._bearer():
                     return self._json(401, {"error": "no key"})
                 return self._json(200, {"object": "list", "data": BARE_MODELS})
@@ -197,6 +197,42 @@ class Fake(BaseHTTPRequestHandler):
                 "usage": {"input_tokens": 11, "output_tokens": 4},
             })
 
+        if mode == "respondent":
+            # responses-only model (opencode Zen Spark shape): chat 500s,
+            # /responses answers
+            if self.path.rstrip("/").endswith("/responses"):
+                img = "image" in json.dumps(body)
+                output = [
+                    {"type": "reasoning", "status": "completed"},
+                    {"type": "message", "role": "assistant", "content": [
+                        {"type": "output_text", "text": "resp ok"}]}]
+                if body.get("tools"):
+                    output.append({"type": "function_call", "call_id": "call_1",
+                                   "name": body["tools"][0].get("name", "tool"),
+                                   "arguments": "{}"})
+                return self._json(200, {
+                    "id": "resp_fake", "object": "response", "status": "completed",
+                    "model": body.get("model"), "error": None,
+                    "output": output,
+                    "usage": {"input_tokens": 306 if img else 6, "output_tokens": 3,
+                              "input_tokens_details": {"cached_tokens": 2}},
+                })
+            return self._json(500, {"type": "error", "error": {
+                "type": "error", "message": "Internal server error"}})
+
+        if mode == "garbled":
+            # HTTP 200 with a non-JSON body on /responses: the gateway must
+            # answer 502 to its client AND log 502 (not 200).
+            if self.path.rstrip("/").endswith("/responses"):
+                raw = b"this is not json"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+                return
+            return self._json(500, {"error": "use /responses"})
+
         if mode == "err200":
             # Listed in /models but every chat call fails INSIDE a 200:
             # the exact false positive that made a dead model look available.
@@ -218,7 +254,8 @@ class Fake(BaseHTTPRequestHandler):
             "model": body.get("model"),
             "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
                          "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7,
+                      "prompt_tokens_details": {"cached_tokens": 1}},
         })
 
     def _sse_head(self):
@@ -234,6 +271,12 @@ class Fake(BaseHTTPRequestHandler):
             chunk = {"id": "c", "object": "chat.completion.chunk", "model": body.get("model"),
                      "choices": [{"index": 0, "delta": {"content": piece + " "}, "finish_reason": None}]}
             self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+        if body.get("stream_options", {}).get("include_usage"):
+            tail = {"id": "c", "object": "chat.completion.chunk", "model": body.get("model"),
+                    "choices": [],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7,
+                              "prompt_tokens_details": {"cached_tokens": 1}}}
+            self.wfile.write(b"data: " + json.dumps(tail).encode() + b"\n\n")
         self.wfile.write(b"data: [DONE]\n\n")
 
     def _anthropic_stream(self, body):

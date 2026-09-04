@@ -24,6 +24,7 @@ from cgw import http as H  # noqa: E402
 from cgw import keyring as K  # noqa: E402
 from cgw import server as SV  # noqa: E402
 from cgw import translate as T  # noqa: E402
+from cgw import usage as U  # noqa: E402
 from cgw.server import serve  # noqa: E402
 
 import fake_upstream  # noqa: E402
@@ -551,6 +552,11 @@ class TestCapabilityFields(unittest.TestCase):
         self.assertIs(D.capability_from_fields(item, "vision"), True)
         self.assertIs(D.capability_from_fields(item, "reasoning"), True)
 
+    def test_empty_modalities_is_unknown_not_text_only(self):
+        self.assertIsNone(D.capability_from_fields({"modalities": []}, "vision"))
+        self.assertIs(D.capability_from_fields({"modalities": ["text"]}, "vision"), False)
+        self.assertIs(D.capability_from_fields({"modalities": ["text", "image"]}, "vision"), True)
+
     def test_false_is_preserved_not_treated_as_missing(self):
         item = {"id": "m", "vision": False, "reasoning": False}
         self.assertIs(D.capability_from_fields(item, "vision"), False)
@@ -665,6 +671,30 @@ class TestCapabilityProbes(unittest.TestCase):
         self.assertIn("inside an HTTP 200", note)
         self.assertIn("not available", note)
 
+    def test_availability_responses_only_model_is_true(self):
+        # chat 500s but /responses answers (opencode Zen Spark shape):
+        # the model is up, on the other endpoint
+        state, note = D.probe_availability(UPBASE + "/respondent/v1", "resp-a", "k", "openai")
+        self.assertIs(state, True)
+        self.assertIn("responses-only", note)
+
+    def test_availability_full_reports_endpoint(self):
+        state, note, endpoint = D.probe_availability_full(UPBASE + "/respondent/v1", "resp-a",
+                                                           "k", "openai")
+        self.assertIs(state, True)
+        self.assertEqual(endpoint, "responses")
+        state, note, endpoint = D.probe_availability_full(UPBASE + "/bare/v1", "bare-a",
+                                                           "k", "openai")
+        self.assertIs(state, True)
+        self.assertIsNone(endpoint)
+
+    def test_availability_responses_account_error_stays_inconclusive(self):
+        # a billing failure on chat must NOT flip to True via /responses;
+        # deadkey 401s every path, so the verdict stays inconclusive
+        state, note = D.probe_availability(UPBASE + "/deadkey/v1", "bare-a", "bad", "openai")
+        self.assertIsNone(state)
+        self.assertIn("account error", note)
+
     def test_reasoning_error_inside_200_is_inconclusive(self):
         state, note = D.probe_reasoning(UPBASE + "/err200/v1", "bare-a", "k", "openai")
         self.assertIsNone(state)
@@ -707,6 +737,26 @@ class TestCapabilityProbes(unittest.TestCase):
         self.assertIn("stated by the provider listing", res["vision_note"])
         self.assertIs(res["available"], True)
         self.assertEqual(len(Fake.hits), 1)  # availability ping only
+
+    def test_inspect_responses_only_model_probes_via_responses(self):
+        res = D.inspect_model(UPBASE + "/respondent/v1", "resp-a", "k", "openai")
+        self.assertIs(res["available"], True)
+        self.assertIn("responses-only", res["available_note"])
+        self.assertEqual(res["endpoint"], "responses")
+        self.assertIs(res["reasoning"], True)
+        self.assertIs(res["vision"], True)
+        self.assertIn("/responses", res["vision_note"])
+
+    def test_reasoning_via_responses(self):
+        state, note = D.probe_reasoning(UPBASE + "/respondent/v1", "resp-a", "k",
+                                        "openai", fast=True, endpoint="responses")
+        self.assertIs(state, True)
+
+    def test_vision_via_responses(self):
+        state, note = D.probe_vision(UPBASE + "/respondent/v1", "resp-a", "k",
+                                     "openai", endpoint="responses")
+        self.assertIs(state, True)
+        self.assertIn("300 extra input tokens", note)
 
     def test_inspect_ask_declines_skip_probes(self):
         # ask=False: unstated capabilities are skipped, not probed
@@ -762,6 +812,15 @@ class TestHfConfigFacts(unittest.TestCase):
         # plain ids (gpt-4o-mini) and multi-slash ids are not Hub repos
         self.assertEqual(D.hf_config_facts("gpt-4o-mini"), {})
         self.assertEqual(D.hf_config_facts("a/b/c"), {})
+
+    def test_arch_heuristic_rejects_text_gen_names(self):
+        # T5/BART-style conditional generation is text-only, not vision
+        self.assertIs(D._arch_has_vision("T5ForConditionalGeneration", {}), False)
+        self.assertIs(D._arch_has_vision("BartForConditionalGeneration", {}), False)
+        self.assertIs(D._arch_has_vision("LlamaForCausalLM", {}), False)
+        self.assertIs(D._arch_has_vision("Qwen2VLForConditionalGeneration", {}), True)
+        self.assertIs(D._arch_has_vision("LlavaLlamaForCausalLM", {"vision_tower": {}}), True)
+        self.assertIs(D._arch_has_vision("", {}), False)
 
 
 class TestQuotaSentinel(unittest.TestCase):
@@ -878,6 +937,63 @@ class TestTranslate(unittest.TestCase):
         out = T.openai_to_anthropic({"model": "m", "messages": [{"role": "user", "content": "h"}], "stop": "END"})
         self.assertEqual(out["stop_sequences"], ["END"])
 
+    def test_anthropic_to_openai_extracts_tool_use(self):
+        got = T.anthropic_to_openai({
+            "id": "msg_2", "model": "claude", "stop_reason": "tool_use",
+            "content": [{"type": "text", "text": "checking"},
+                        {"type": "tool_use", "id": "toolu_7",
+                         "name": "get_time", "input": {"x": 1}}],
+            "usage": {"input_tokens": 8, "output_tokens": 3}}, "claude")
+        msg = got["choices"][0]["message"]
+        self.assertEqual(msg["content"], "checking")
+        self.assertEqual(msg["tool_calls"], [{"id": "toolu_7", "type": "function",
+                                              "function": {"name": "get_time",
+                                                           "arguments": '{"x": 1}'}}])
+        self.assertEqual(got["choices"][0]["finish_reason"], "tool_calls")
+
+    def test_openai_to_anthropic_forwards_tools(self):
+        out = T.openai_to_anthropic({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "get_time", "description": "clock",
+                "parameters": {"type": "object", "properties": {}}}}],
+            "tool_choice": "none"})
+        self.assertEqual(out["tools"], [{"name": "get_time", "description": "clock",
+                                         "input_schema": {"type": "object", "properties": {}}}])
+        self.assertEqual(out["tool_choice"], {"type": "none"})
+
+    def test_openai_to_anthropic_keeps_tool_history(self):
+        out = T.openai_to_anthropic({
+            "model": "m", "messages": [
+                {"role": "user", "content": "time?"},
+                {"role": "assistant", "content": "",
+                 "tool_calls": [{"id": "c1", "type": "function",
+                                 "function": {"name": "get_time", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "noon"}]})
+        kinds = []
+        for m in out["messages"]:
+            c = m["content"]
+            kinds.extend(b.get("type") for b in (c if isinstance(c, list) else []))
+        self.assertIn("tool_use", kinds)
+        self.assertIn("tool_result", kinds)
+        texts = []
+        for m in out["messages"]:
+            c = m["content"]
+            texts.extend(b.get("text") for b in (c if isinstance(c, list) else [])
+                         if b.get("type") == "text")
+        self.assertNotIn("", texts)
+
+    def test_chat_to_responses_keeps_images(self):
+        out = T.chat_to_responses({
+            "model": "m", "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "see?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}]}]})
+        self.assertIsInstance(out["input"], list)
+        blob = out["input"][0]["content"]
+        self.assertIn({"type": "input_text", "text": "see?"}, blob)
+        self.assertIn({"type": "input_image", "image_url": "data:image/png;base64,AAA"}, blob)
+
     def test_response_converted(self):
         got = T.anthropic_to_openai({
             "id": "msg_1", "model": "claude", "stop_reason": "max_tokens",
@@ -886,6 +1002,63 @@ class TestTranslate(unittest.TestCase):
         self.assertEqual(got["choices"][0]["message"]["content"], "hello")
         self.assertEqual(got["choices"][0]["finish_reason"], "length")
         self.assertEqual(got["usage"]["total_tokens"], 5)
+
+    def test_chat_to_responses(self):
+        out = T.chat_to_responses({"model": "m", "max_tokens": 44, "temperature": 0.5,
+                                   "messages": [{"role": "system", "content": "be brief"},
+                                                {"role": "user", "content": "hi"}]})
+        self.assertEqual(out["model"], "m")
+        self.assertEqual(out["input"], "System: be brief\n\nhi")
+        self.assertEqual(out["max_output_tokens"], 44)
+        self.assertEqual(out["temperature"], 0.5)
+        self.assertNotIn("stream", out)
+
+    def test_chat_to_responses_forwards_tools(self):
+        out = T.chat_to_responses({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "get_time", "description": "clock",
+                "parameters": {"type": "object", "properties": {}}}}],
+            "tool_choice": {"type": "function", "function": {"name": "get_time"}}})
+        self.assertEqual(out["tools"], [{"type": "function", "name": "get_time",
+                                         "description": "clock",
+                                         "parameters": {"type": "object", "properties": {}}}])
+        self.assertEqual(out["tool_choice"], {"type": "function", "name": "get_time"})
+
+    def test_chat_to_responses_keeps_tool_history(self):
+        out = T.chat_to_responses({
+            "model": "m", "messages": [
+                {"role": "user", "content": "what time is it"},
+                {"role": "assistant", "content": "",
+                 "tool_calls": [{"id": "c1", "type": "function",
+                                 "function": {"name": "get_time", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "noon"}]})
+        self.assertIn("Assistant called: get_time({})", out["input"])
+        self.assertIn("Tool result: noon", out["input"])
+
+    def test_responses_to_chat_extracts_function_calls(self):
+        obj = {"id": "resp_2", "model": "spark", "output": [
+            {"type": "function_call", "call_id": "call_9",
+             "name": "get_time", "arguments": "{}"}],
+            "usage": {"input_tokens": 4, "output_tokens": 2}}
+        got = T.responses_to_chat(obj, "spark")
+        msg = got["choices"][0]["message"]
+        self.assertEqual(msg["tool_calls"], [{"id": "call_9", "type": "function",
+                                              "function": {"name": "get_time",
+                                                           "arguments": "{}"}}])
+        self.assertEqual(got["choices"][0]["finish_reason"], "tool_calls")
+
+    def test_responses_to_chat(self):
+        obj = {"id": "resp_1", "model": "spark", "output": [
+            {"type": "reasoning", "status": "completed"},
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "hello"}]}],
+            "usage": {"input_tokens": 6, "output_tokens": 3}}
+        got = T.responses_to_chat(obj, "spark")
+        self.assertEqual(got["object"], "chat.completion")
+        self.assertEqual(got["choices"][0]["message"]["content"], "hello")
+        self.assertEqual(got["usage"], {"prompt_tokens": 6, "completion_tokens": 3,
+                                        "total_tokens": 9})
 
     def test_stream_translation(self):
         tr = T.StreamTranslator("m")
@@ -904,6 +1077,25 @@ class TestTranslate(unittest.TestCase):
         tr = T.StreamTranslator("m")
         self.assertEqual(tr.feed("event: message_start"), b"")
         self.assertEqual(tr.feed(""), b"")
+
+    def test_stream_translator_rebuilds_tool_calls(self):
+        tr = T.StreamTranslator("m")
+        out = b""
+        for line in ['data: {"type":"content_block_start","index":0,'
+                     '"content_block":{"type":"tool_use","id":"toolu_1","name":"get_time"}}',
+                     'data: {"type":"content_block_delta","index":0,'
+                     '"delta":{"type":"input_json_delta","partial_json":"{\\"x\\""}}',
+                     'data: {"type":"content_block_delta","index":0,'
+                     '"delta":{"type":"input_json_delta","partial_json":": 1}"}}',
+                     'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}',
+                     'data: {"type":"message_stop"}']:
+            out += tr.feed(line)
+        text = out.decode()
+        self.assertIn('"name": "get_time"', text)
+        self.assertIn('toolu_1', text)
+        self.assertIn('{\\"x\\"', text)
+        self.assertIn(': 1}', text)
+        self.assertIn('"finish_reason": "tool_calls"', text)
 
 
 class ServerCase(unittest.TestCase):
@@ -945,6 +1137,29 @@ class TestServer(ServerCase):
                    {"model": "bare/bare-a", "messages": [{"role": "user", "content": "hi"}]})
         self.assertTrue(r.ok, r.text())
         self.assertEqual(r.json()["choices"][0]["message"]["content"], "bare ok")
+
+    def test_responses_only_model_served_as_chat(self):
+        p = C.new_provider("resp", UPBASE + "/respondent/v1", ["k"], flavor="openai")
+        p["models"] = {"resp-a": {"endpoint": "responses"}}
+        base = self.boot([p])
+        r = H.post(base + "/v1/chat/completions",
+                   {"model": "resp/resp-a", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertTrue(r.ok, r.text())
+        body = r.json()
+        self.assertEqual(body["object"], "chat.completion")
+        self.assertEqual(body["choices"][0]["message"]["content"], "resp ok")
+
+    def test_responses_only_model_streamed_as_chat(self):
+        p = C.new_provider("resp", UPBASE + "/respondent/v1", ["k"], flavor="openai")
+        p["models"] = {"resp-a": {"endpoint": "responses"}}
+        base = self.boot([p])
+        r = H.post(base + "/v1/chat/completions",
+                   {"model": "resp/resp-a", "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}]})
+        self.assertTrue(r.ok, r.text())
+        self.assertIn("resp ok", r.text())
+        self.assertIn('"finish_reason": "stop"', r.text())
+        self.assertIn("[DONE]", r.text())
 
     def test_logs_endpoint_records_key(self):
         p = C.new_provider("logs", UPBASE + "/logs/v1", ["k1", "k2"],
@@ -1426,6 +1641,334 @@ class TestCli(unittest.TestCase):
                                capture_output=True, text=True, timeout=60)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("no saved values", r.stdout)
+
+
+class TestUsageExtract(unittest.TestCase):
+    def test_openai_shape(self):
+        got = U.extract_openai_usage({"prompt_tokens": 10, "completion_tokens": 4,
+                                      "total_tokens": 14})
+        self.assertEqual(got, {"pin": 10, "pout": 4})
+
+    def test_openai_cached_details(self):
+        got = U.extract_openai_usage({"prompt_tokens": 10, "completion_tokens": 4,
+                                      "prompt_tokens_details": {"cached_tokens": 7}})
+        self.assertEqual(got, {"pin": 10, "pout": 4, "cached": 7})
+
+    def test_openai_cache_hit_variant(self):
+        got = U.extract_openai_usage({"prompt_tokens": 10, "completion_tokens": 4,
+                                      "prompt_cache_hit_tokens": 3})
+        self.assertEqual(got.get("cached"), 3)
+
+    def test_responses_shape(self):
+        got = U.extract_responses_usage({"input_tokens": 306, "output_tokens": 3,
+                                        "input_tokens_details": {"cached_tokens": 2}})
+        self.assertEqual(got, {"pin": 306, "pout": 3, "cached": 2})
+
+    def test_responses_list_details(self):
+        got = U.extract_responses_usage({"input_tokens": 5, "output_tokens": 1,
+                                        "input_tokens_details": [{"cached_tokens": 4}]})
+        self.assertEqual(got.get("cached"), 4)
+
+    def test_anthropic_shape(self):
+        got = U.extract_anthropic_usage({"input_tokens": 11, "output_tokens": 4,
+                                        "cache_read_input_tokens": 9})
+        self.assertEqual(got, {"pin": 11, "pout": 4, "cached": 9})
+
+    def test_chunk_shape(self):
+        got = U.extract_chunk_usage({"choices": [], "usage": {"prompt_tokens": 5,
+                                     "completion_tokens": 2}})
+        self.assertEqual(got, {"pin": 5, "pout": 2})
+
+    def test_garbage_is_empty(self):
+        self.assertEqual(U.extract_openai_usage(None), {})
+        self.assertEqual(U.extract_openai_usage({"prompt_tokens": "x"}), {})
+        self.assertEqual(U.extract_chunk_usage({"choices": []}), {})
+
+    def test_translator_collects_anthropic_usage(self):
+        tr = T.StreamTranslator("m")
+        tr.feed('data: {"type":"message_start","message":{"usage":{"input_tokens":11,'
+                '"cache_read_input_tokens":9}}}')
+        tr.feed('data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+                '"usage":{"output_tokens":4}}')
+        self.assertEqual(tr.usage(), {"pin": 11, "pout": 4, "cached": 9})
+
+    def test_anthropic_fold_keeps_cache(self):
+        obj = T.anthropic_to_openai({"id": "m", "model": "mm", "stop_reason": "end_turn",
+                                    "content": [{"type": "text", "text": "hi"}],
+                                    "usage": {"input_tokens": 11, "output_tokens": 4,
+                                              "cache_read_input_tokens": 9}}, "mm")
+        self.assertEqual(obj["usage"]["prompt_tokens_details"], {"cached_tokens": 9})
+
+
+class TestUsageAggregate(unittest.TestCase):
+    def test_totals_and_hit_rate(self):
+        now = time.time()
+        entries = [
+            {"t": now, "model": "a/m1", "status": 200, "pin": 100, "pout": 20, "cached": 40},
+            {"t": now, "model": "a/m1", "status": 200, "pin": 100, "pout": 10},
+            {"t": now, "model": "b/m2", "status": 500},
+            {"t": now, "model": "b/m2", "status": 200},
+        ]
+        agg = U.aggregate(entries)
+        m1 = agg["by_model"]["a/m1"]
+        self.assertEqual((m1["reqs"], m1["errs"]), (2, 0))
+        self.assertEqual((m1["pin"], m1["pout"], m1["cached"]), (200, 30, 40))
+        self.assertEqual(m1["unknown"], 0)
+        self.assertAlmostEqual(U.hit_rate(m1), 20.0)
+        m2 = agg["by_model"]["b/m2"]
+        self.assertEqual((m2["reqs"], m2["errs"], m2["unknown"]), (2, 1, 1))
+        self.assertEqual(sorted(agg["by_provider"]), ["a", "b"])
+
+    def test_render_marks_unknown(self):
+        now = time.time()
+        out = U.render([{"t": now, "model": "a/m1", "status": 200}], days=7, by="model")
+        self.assertIn("a/m1", out)
+        self.assertIn("n/a", out)
+
+    def test_summary_for_scopes(self):
+        now = time.time()
+        entries = [
+            {"t": now - 100, "model": "a/m1", "status": 200, "pin": 100, "pout": 10, "cached": 25},
+            {"t": now - 100, "model": "a/m2", "status": 200, "pin": 300, "pout": 30},
+            {"t": now - 20 * 86400, "model": "a/m1", "status": 200, "pin": 50, "pout": 5},
+        ]
+        week = dict(U.summary_for(entries, "a/m1"))
+        self.assertEqual(week["7d"]["reqs"], 1)
+        self.assertEqual(week["7d"]["pin"], 100)
+        self.assertEqual(week["30d"]["reqs"], 2)
+        prov = dict(U.summary_for(entries, "a"))
+        self.assertEqual(prov["7d"]["reqs"], 2)
+        self.assertEqual(prov["7d"]["pin"], 400)
+        self.assertEqual(prov["7d"]["cached"], 25)
+        # a bare name never matches 'other/m1' by prefix
+        other = dict(U.summary_for(entries, "m1"))
+        self.assertEqual(other["7d"]["reqs"], 0)
+        # legacy int windows and explicit (label, seconds) pairs
+        legacy = dict(U.summary_for(entries, "a/m1", windows=(7,)))
+        self.assertEqual(legacy["7d"]["reqs"], 1)
+        sess = dict(U.summary_for(entries, "a/m1", windows=[("session", 3600)]))
+        self.assertEqual(sess["session"]["reqs"], 1)
+
+    def test_render_window_label(self):
+        now = time.time()
+        entries = [{"t": now - 100, "model": "a/m1", "status": 200,
+                    "pin": 100, "pout": 10, "cached": 25}]
+        out = U.render(entries, days="24h", by="model")
+        self.assertIn("last 24h", out)
+        self.assertIn("a/m1", out)
+        out = U.render(entries, by="model", window=("session", 3600))
+        self.assertIn("last session", out)
+        # explicit-span quad: only entries inside [since, until] count
+        out = U.render(
+            [{"t": now - 5000, "model": "a/m1", "status": 200, "pin": 10, "pout": 1},
+             {"t": now - 100, "model": "a/m1", "status": 200, "pin": 100, "pout": 10}],
+            by="model", window=("session abc", 0, now - 1000, now - 50))
+        self.assertIn("a/m1", out)
+        self.assertIn("100", out)
+        self.assertNotIn("110", out)
+
+    def test_hermes_sessions_reads_db(self):
+        import sqlite3
+        import tempfile
+        import os
+        d = tempfile.mkdtemp()
+        db = os.path.join(d, "state.db")
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT,"
+                    " display_name TEXT, started_at REAL, ended_at REAL,"
+                    " message_count INTEGER)")
+        con.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT,"
+                    " role TEXT, content TEXT)")
+        con.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?)",
+                    ("20260904_x", "cli", "work", 1000.0, 2000.0, 5))
+        con.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?)",
+                    ("20260905_y", "cli", None, 3000.0, None, 2))
+        con.execute("INSERT INTO messages VALUES (?,?,?,?)",
+                    (1, "20260904_x", "user", "  hello\nworld  "))
+        con.commit()
+        con.close()
+        got = U.hermes_sessions(db_path=db)
+        self.assertEqual([s["id"] for s in got], ["20260905_y", "20260904_x"])
+        self.assertEqual(got[0]["name"], "20260905_y")
+        self.assertIsNone(got[0]["ended"])
+        self.assertEqual(got[1]["title"], "hello world")
+        self.assertEqual(U.hermes_sessions(db_path=os.path.join(d, "nope.db")), [])
+
+    def test_half_present_counts_agree(self):
+        # pin-only entries are known (missing half = 0) in BOTH views
+        now = time.time()
+        entries = [{"t": now - 50, "model": "a/m1", "key": "k1", "status": 200,
+                    "pin": 100}]
+        agg = U.aggregate(entries)["by_model"]["a/m1"]
+        summ = dict(U.summary_for(entries, "a/m1"))["7d"]
+        self.assertEqual((agg["unknown"], agg["pin"]), (0, 100))
+        self.assertEqual((summ["unknown"], summ["pin"]), (0, 100))
+
+
+class TestUsageFile(unittest.TestCase):
+    def test_roundtrip_and_bad_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "usage.jsonl")
+            U.append(path, {"t": 1.0, "model": "a/m", "status": 200, "pin": 3})
+            with open(path, "a") as fh:
+                fh.write("not json\n")
+            back = U.load(path)
+            self.assertEqual(len(back), 1)
+            self.assertEqual(back[0]["pin"], 3)
+            self.assertEqual(U.load(path, since=2.0), [])
+
+    def test_trim_caps_size(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "usage.jsonl")
+            for i in range(200):
+                U.append(path, {"t": float(i), "model": "a/m", "status": 200,
+                                "pin": i, "note": "x" * 200})
+            U.trim(path, keep_bytes=4096)
+            self.assertLess(os.path.getsize(path), 8192)
+            back = U.load(path)
+            self.assertTrue(back)
+            self.assertEqual(back[-1]["pin"], 199)
+
+
+class FakeScr:
+    """Minimal curses window double for prompt(): canned keys in, text out."""
+
+    def __init__(self, keys, width=80):
+        self.keys = list(keys)
+        self.width = width
+
+    def getmaxyx(self):
+        return (24, self.width)
+
+    def move(self, y, x):
+        pass
+
+    def clrtoeol(self):
+        pass
+
+    def addnstr(self, y, x, s, n, *a):
+        pass
+
+    def refresh(self):
+        pass
+
+    def get_wch(self):
+        if not self.keys:
+            return "\n"
+        return self.keys.pop(0)
+
+
+class TestPromptLive(unittest.TestCase):
+    def test_on_change_fires_per_keystroke(self):
+        from cgw.tui import Tui
+
+        seen = []
+        scr = FakeScr(["a", "b", "\x7f", "c", "\n"])
+        got = Tui.prompt(Tui.__new__(Tui), scr, "filter: ", on_change=seen.append)
+        self.assertEqual(got, "ac")
+        self.assertEqual(seen, ["a", "ab", "a", "ac"])
+
+    def test_no_callback_behaves_as_before(self):
+        from cgw.tui import Tui
+
+        scr = FakeScr(["x", "y", "\n"])
+        self.assertEqual(Tui.prompt(Tui.__new__(Tui), scr, "name: "), "xy")
+
+
+class TestUsageServer(ServerCase):
+    def _last_log(self, base, model):
+        r = H.get(base + "/v1/logs?n=20")
+        self.assertTrue(r.ok)
+        hits = [e for e in r.json()["entries"] if e.get("model") == model]
+        self.assertTrue(hits, "no log entry for %s" % model)
+        return hits[-1]
+
+    def test_nonstream_usage_logged_and_persisted(self):
+        p = C.new_provider("chat", UPBASE + "/bare/v1", ["k"], flavor="openai")
+        p["models"] = {"bare-a": {}}
+        base = self.boot([p])
+        r = H.post(base + "/v1/chat/completions",
+                   {"model": "chat/bare-a", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertTrue(r.ok, r.text())
+        entry = self._last_log(base, "chat/bare-a")
+        self.assertEqual((entry.get("pin"), entry.get("pout"), entry.get("cached")), (5, 2, 1))
+        rows = U.load(os.path.join(self.dir, "usage.jsonl"))
+        self.assertTrue(any(e.get("model") == "chat/bare-a" and e.get("pin") == 5
+                            for e in rows))
+
+    def test_stream_usage_logged(self):
+        p = C.new_provider("chat", UPBASE + "/bare/v1", ["k"], flavor="openai")
+        p["models"] = {"bare-a": {}}
+        base = self.boot([p])
+        r = H.post(base + "/v1/chat/completions",
+                   {"model": "chat/bare-a", "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}]})
+        self.assertTrue(r.ok, r.text())
+        entry = self._last_log(base, "chat/bare-a")
+        self.assertEqual((entry.get("pin"), entry.get("pout"), entry.get("cached")), (5, 2, 1))
+
+    def test_responses_usage_logged(self):
+        p = C.new_provider("resp", UPBASE + "/respondent/v1", ["k"], flavor="openai")
+        p["models"] = {"resp-a": {"endpoint": "responses"}}
+        base = self.boot([p])
+        r = H.post(base + "/v1/chat/completions",
+                   {"model": "resp/resp-a", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertTrue(r.ok, r.text())
+        entry = self._last_log(base, "resp/resp-a")
+        self.assertEqual((entry.get("pin"), entry.get("pout"), entry.get("cached")), (6, 3, 2))
+
+    def test_healthz_reports_boot_time(self):
+        base = self.boot([])
+        r = H.get(base + "/healthz")
+        self.assertTrue(r.ok)
+        started = (r.json() or {}).get("started")
+        self.assertTrue(isinstance(started, int) and started <= time.time())
+
+    def test_responses_tool_calls_survive_roundtrip(self):
+        p = C.new_provider("resp", UPBASE + "/respondent/v1", ["k"], flavor="openai")
+        p["models"] = {"resp-a": {"endpoint": "responses"}}
+        base = self.boot([p])
+        r = H.post(base + "/v1/chat/completions",
+                   {"model": "resp/resp-a", "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{"type": "function", "function": {"name": "get_time"}}]})
+        self.assertTrue(r.ok, r.text())
+        msg = r.json()["choices"][0]["message"]
+        self.assertEqual(msg["tool_calls"][0]["function"]["name"], "get_time")
+        self.assertEqual(r.json()["choices"][0]["finish_reason"], "tool_calls")
+        r = H.post(base + "/v1/chat/completions",
+                   {"model": "resp/resp-a", "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{"type": "function", "function": {"name": "get_time"}}]})
+        self.assertTrue(r.ok, r.text())
+        self.assertIn("get_time", r.text())
+        self.assertIn('"finish_reason": "tool_calls"', r.text())
+
+    def test_garbled_responses_payload_logs_502(self):
+        p = C.new_provider("gar", UPBASE + "/garbled/v1", ["k"], flavor="openai")
+        p["models"] = {"gar-a": {"endpoint": "responses"}}
+        base = self.boot([p])
+        r = H.post(base + "/v1/chat/completions",
+                   {"model": "gar/gar-a", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(r.status, 502)
+        r = H.get(base + "/v1/logs?n=5")
+        entries = [e for e in r.json()["entries"] if e["model"] == "gar/gar-a"]
+        self.assertTrue(entries)
+        self.assertEqual(entries[-1]["status"], 502)
+
+    def test_stats_command_reads_log(self):
+        import subprocess
+        p = C.new_provider("chat", UPBASE + "/bare/v1", ["k"], flavor="openai")
+        p["models"] = {"bare-a": {}}
+        base = self.boot([p])
+        H.post(base + "/v1/chat/completions",
+               {"model": "chat/bare-a", "messages": [{"role": "user", "content": "hi"}]})
+        cg = os.path.join(ROOT, "cg")
+        cfg = os.path.join(self.dir, "config.json")
+        r = subprocess.run([sys.executable, cg, "--config", cfg, "stats", "--days", "1"],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("chat/bare-a", r.stdout)
+        self.assertIn("5", r.stdout)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,18 @@
 
 All notable changes to CG — AI TUI Gateway. Format follows [Keep a Changelog](https://keepachangelog.com/), versions follow [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Live model search: `/` in the TUI now filters as you type (Enter keeps, ESC clears)
+- Token accounting: every successful request logs tokens in/out/cached to `usage.jsonl`; new `cg stats [--window W] [--by model|provider]` table with windows 15min–30d plus session (this gateway run); `/v1/logs` entries carry the same counts
+- TUI `u` key: time/session scope picker — time windows 15min–30d, or a searchable Hermes-session browser (id + first-message title column, full title in the result) with backspace to go back a level; `cg stats --session ID` does the same on the CLI
+- Probe cancellation: backspace (or ESC) aborts an in-flight model inspect, discarding partial results; the availability sweep stops too, keeping whatever it finished
+- F5 refresh: re-reads the config from disk and re-checks the gateway without restarting the TUI (R stays revive)
+- Tool calls through /responses-only models: `tools`/`tool_choice` forwarded upstream, `function_call` items folded back to OpenAI `tool_calls` (both plain and streamed) — agentic clients no longer stall waiting for calls that never arrive
+- Audit-fix batch: tool definitions, history, and streamed tool calls on the Anthropic path; vision images through /responses (`input_image`); HF vision heuristic no longer flags T5/BART-style text models; empty `modalities: []` reads unknown instead of text-only; usage math unified; streamed Responses cache hits kept; relay error statuses logged truthfully; usage-file writes serialized; vision-probe thread failures read inconclusive
+
 ## [1.0.0] — 2026-08-31
 
 Initial public release.

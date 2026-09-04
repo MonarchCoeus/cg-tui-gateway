@@ -178,7 +178,7 @@ def normalize(cfg):
                 if meta.get(field) is not None:
                     entry[field] = bool(meta[field])
             for field in ("reasoning_note", "vision_note", "checked",
-                          "available", "available_note"):
+                          "available", "available_note", "endpoint"):
                 if meta.get(field) is not None:
                     entry[field] = meta[field]
             # a manually-set context window (tokens); None means unset

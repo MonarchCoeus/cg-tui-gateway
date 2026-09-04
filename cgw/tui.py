@@ -14,6 +14,7 @@ import time
 from . import config as C
 from . import detect as D
 from . import http as H
+from . import usage as U
 
 def _ctx(val):
     """Human-readable context size: '200k' / '1.5M' / '-' when unset."""
@@ -31,6 +32,10 @@ def _ctx(val):
 
 
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+class _ProbeCancelled(Exception):
+    """Raised inside a probe worker when the user hits backspace/ESC."""
 
 
 def _glyph(val, cl):
@@ -260,7 +265,7 @@ class Tui:
     # the terminal is too narrow to hold both.
     MIN_INPUT_COLS = 10
 
-    def prompt(self, scr, label, secret=False):
+    def prompt(self, scr, label, secret=False, on_change=None):
         """Read a line at the bottom of the screen. Never truncates the value.
 
         Hand-rolled rather than curses.getstr(), which echoes into the window
@@ -275,6 +280,10 @@ class Tui:
           * the label is shortened, not the value, when space runs out;
           * the geometry is re-read every keystroke, so a mid-entry resize is
             handled.
+
+        on_change, when given, fires with the current buffer after every
+        keystroke that mutates it — the live model filter uses this to
+        shrink the list while typing.
         """
         buf = []
         while True:
@@ -313,22 +322,22 @@ class Tui:
                 break
             if ch == "\x1b":  # ESC cancels
                 return ""
+            before = "".join(buf) if on_change is not None else None
             if ch in ("\x7f", "\b", curses.KEY_BACKSPACE, 263, 127, 8):
                 if buf:
                     buf.pop()
-                continue
-            if ch == "\x15":  # ctrl-u clears the line
+            elif ch == "\x15":  # ctrl-u clears the line
                 buf = []
-                continue
-            if ch == "\x17":  # ctrl-w deletes the last word
+            elif ch == "\x17":  # ctrl-w deletes the last word
                 while buf and buf[-1].isspace():
                     buf.pop()
                 while buf and not buf[-1].isspace():
                     buf.pop()
-                continue
-            if isinstance(ch, str) and ch.isprintable():
+            elif isinstance(ch, str) and ch.isprintable():
                 buf.append(ch)
             # arrows, resize, function keys and other non-text are ignored
+            if on_change is not None and "".join(buf) != before:
+                on_change("".join(buf))
 
         return "".join(buf).strip()
 
@@ -336,6 +345,27 @@ class Tui:
         """Ask a yes/no question; bare Enter means yes (defaults to Y/n)."""
         val = self.prompt(scr, label + " [Y/n] ").strip().lower()
         return val == "" or val.startswith("y")
+
+    def live_filter(self, scr):
+        """Find-as-you-type over the current provider's model list.
+
+        Every keystroke re-applies the filter and redraws, so a 300-model
+        list shrinks while typing. Enter keeps the filter, ESC clears it.
+        """
+        self.focus = "right"
+
+        def apply(text):
+            text = text.strip()
+            if text != self.filter:
+                self.filter = text
+                self.msel = 0
+                self.mtop = 0
+            self.draw(scr)
+
+        val = self.prompt(scr, "filter models: ", on_change=apply)
+        self.filter = (val or "").strip()
+        self.msel = 0
+        self.mtop = 0
 
     # ---------- drawing ----------
 
@@ -394,14 +424,9 @@ class Tui:
             scr.addnstr(3 + i, 0, "▸" if cur else " ", 1,
                         cl["sel"] if sel else cl["dim"])
             scr.addnstr(3 + i, 1, "%s " % mark, 2, m_attr)
-            name = p["name"][:max(4, left_w - 7)]
+            name = p["name"][:max(4, left_w - 5)]
             scr.addnstr(3 + i, 3, name, len(name),
                         cl["sel"] if sel else cl["accent"])
-            cnt = "%3d" % len(p.get("models") or {})
-            cnt_x = 4 + len(name)
-            if cnt_x + len(cnt) <= left_w:
-                scr.addnstr(3 + i, cnt_x, cnt, len(cnt),
-                            cl["sel"] if sel else curses.A_NORMAL)
 
         # divider between left and middle panes
         for y in range(2, h - 2):
@@ -555,9 +580,10 @@ class Tui:
                 binds = [("a", "add"), ("e", "edit"), ("d", "del"), ("K", "keys"),
                          ("r", "refresh"), ("t", "on/off"), ("T", "all-models"),
                          ("j/k", "move"), ("ENTER", "inspect"), ("c", "context"),
-                         ("x", "reset"), ("m", "add"), ("/", "filter"), ("A", "avail-all"),
+                         ("x", "reset"), ("m", "add"), ("/", "find"), ("A", "avail-all"),
+                         ("u", "usage"),
                          ("R", "revive"), ("l", "logs"), ("tab", "switch"),
-                         ("?", "help"), ("q", "quit")]
+                         ("F5", "refresh"), ("?", "help"), ("q", "quit")]
                 if y < h - 2:
                     scr.addnstr(y, insp_x + 1, "keys", insp_w - 2, curses.A_NORMAL)
                     y += 1
@@ -696,7 +722,16 @@ class Tui:
             self.save()
 
     def inspect(self, scr):
-        """Probe the highlighted model: reasoning, vision, availability."""
+        """Probe the highlighted model: reasoning, vision, availability.
+
+        The probe runs in a worker thread but ALL curses I/O stays on the
+        main thread: progress updates and yes/no questions go through a
+        queue, and the main loop handles drawing + input. Without this,
+        concurrent curses writes from two threads flicker the prompt and
+        the main loop's getch steals the user's answer before confirm()
+        can read it.
+        """
+        import queue
         p = self.cur()
         if not p:
             return
@@ -708,16 +743,93 @@ class Tui:
         if not keys:
             self.msg = "no enabled keys"
             return
+        self._probe_cancel = False
+        ui_q = queue.Queue()
+        done = {}
 
         def prog(stage):
-            self.busy = "inspecting %s — %s ..." % (mid[:32], stage)
-            self.draw(scr)
+            if self._probe_cancel:
+                raise _ProbeCancelled()
+            ui_q.put(("progress", stage))
 
-        res = D.inspect_model(p["base_url"], mid, keys[0], p.get("flavor", "openai"),
-                              listing_item=D.stated_facts(meta),
-                              progress=prog,
-                              ask=lambda q: self.confirm(scr, q))
+        def ask(q):
+            if self._probe_cancel:
+                raise _ProbeCancelled()
+            ev = threading.Event()
+            ans = [None]
+            ui_q.put(("ask", q, ev, ans))
+            ev.wait()
+            if self._probe_cancel:
+                raise _ProbeCancelled()
+            return bool(ans[0])
+
+        def run():
+            try:
+                done["res"] = D.inspect_model(
+                    p["base_url"], mid, keys[0], p.get("flavor", "openai"),
+                    listing_item=D.stated_facts(meta), progress=prog, ask=ask)
+            except _ProbeCancelled:
+                done["cancelled"] = True
+            except Exception as e:  # noqa: BLE001 - probe must report, not crash
+                done["error"] = e
+
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+        self.busy = "inspecting %s ..." % mid[:32]
+        scr.timeout(100)
+        deadline = time.time() + 60
+        timed_out = False
+        pending_ask = None
+        try:
+            while th.is_alive() or pending_ask is not None:
+                if time.time() > deadline and pending_ask is None:
+                    timed_out = True
+                    self._probe_cancel = True
+                    break
+                # Drain UI events without blocking the input loop.
+                while True:
+                    try:
+                        ev = ui_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if ev[0] == "progress":
+                        self.busy = "inspecting %s — %s ... (backspace cancels)" % (mid[:32], ev[1])
+                    elif ev[0] == "ask":
+                        pending_ask = ev
+                        self.busy = None
+                        break
+                if pending_ask is not None:
+                    _, q, evt, ans_holder = pending_ask
+                    val = self.confirm(scr, q)
+                    ans_holder[0] = val
+                    evt.set()
+                    pending_ask = None
+                    self.busy = "inspecting %s ..." % mid[:32]
+                    continue
+                self.draw(scr)
+                try:
+                    ch = scr.getch()
+                except KeyboardInterrupt:
+                    self._probe_cancel = True
+                    break
+                if ch in (curses.KEY_BACKSPACE, 263, 127, 8, 27):
+                    self._probe_cancel = True
+                    self.busy = "cancelling probe ..."
+                    self.draw(scr)
+                    break
+        finally:
+            scr.timeout(-1)
+        th.join(timeout=5)
         self.busy = None
+        if "res" in done:
+            res = done["res"]
+        elif "error" in done:
+            self.msg = "probe failed: %s" % done["error"]
+            return
+        else:
+            self.msg = ("probe timed out after 60s — dropped"
+                        if timed_out else "probe cancelled")
+            return
 
         entry = D.merge_inspection(meta, res)
         p.setdefault("models", {})[mid] = entry
@@ -917,9 +1029,9 @@ class Tui:
             ("left pane", "r:refresh t:on/off T:all-models"),
             ("right", "j/k  move · ENTER:inspect t:on/off T:all-models"),
             ("right", "A:avail-all (one call per model) · c:context"),
-            ("right", "x:reset m:add /:filter"),
+            ("right", "x:reset m:add /:find-as-you-type u:usage"),
             ("both", "TAB/←→  switch pane · R:revive keys · ?:this help"),
-            ("both", "l:live-log terminal · q or ESC  quit"),
+            ("both", "F5 refresh from disk · l:live-log · q or ESC quit"),
         ]
         bw = min(w - 4, 62)
         bh = len(rows) + 4
@@ -932,6 +1044,259 @@ class Tui:
         win.addnstr(bh - 2, 2, "any key to close", bw - 4, curses.A_DIM)
         win.refresh()
         win.getch()
+
+    def _listen_base(self):
+        listen = self.cfg.get("listen") or {}
+        return (listen.get("host", "127.0.0.1"), listen.get("port", C.DEFAULT_PORT))
+
+    def pick_window(self, scr, opts, title=" window ", sel=0,
+                      footer="j/k move · enter pick · backspace back · esc",
+                      none_msg="unavailable", back="BACK"):
+        """Single-column picker overlay: j/k + arrows + Enter, ESC cancels.
+
+        opts are (display, value); a None value grays the row out.
+        Returns the picked (display, value), the string "BACK" on
+        backspace, or None on ESC/q.
+        """
+        h, w = scr.getmaxyx()
+        bw = 40
+        bh = len(opts) + 4
+        top, left = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        win = curses.newwin(bh, bw, top, left)
+        win.keypad(True)  # without this, arrows arrive as ESC and cancel
+        while True:
+            round_box(win, title)
+            for i, (txt, val) in enumerate(opts):
+                if val is None:
+                    shown, attr = "%s (%s)" % (txt, none_msg), self.cl["dim"]
+                else:
+                    shown, attr = txt, self.cl["sel"] if i == sel else curses.A_NORMAL
+                try:
+                    win.addnstr(1 + i, 2, " %-*s" % (bw - 4, shown), bw - 4, attr)
+                except curses.error:
+                    pass
+            try:
+                win.addnstr(bh - 2, 2, footer, bw - 4, curses.A_DIM)
+            except curses.error:
+                pass
+            win.refresh()
+            try:
+                ch = win.getch()
+            except KeyboardInterrupt:
+                return None
+            if ch in (27, ord("q")):
+                return None
+            if ch in (curses.KEY_BACKSPACE, 263, 127, 8):
+                return back
+            if ch in (ord("j"), curses.KEY_DOWN):
+                sel = min(sel + 1, len(opts) - 1)
+            elif ch in (ord("k"), curses.KEY_UP):
+                sel = max(sel - 1, 0)
+            elif ch in (curses.KEY_ENTER, 10, 13):
+                txt, val = opts[sel]
+                if val is None:
+                    self.msg = "%s %s" % (txt, none_msg)
+                    return None
+                return (txt, val)
+            # other keys ignored
+
+    def pick_session(self, scr, run_secs):
+        """Hermes-session browser: type to filter by id/title, Enter picks.
+
+        Backspace on an empty filter goes back one level ("BACK").
+        Returns (label, span_secs, since, until, title) for the result box,
+        "BACK", or None.
+        """
+        rows = []
+        if run_secs is not None:
+            now = time.time()
+            rows.append(("this gateway run",
+                         ("session (run)", run_secs, now - run_secs, None, "")))
+        for s in U.hermes_sessions():
+            span = (s["ended"] or time.time()) - s["started"]
+            when = time.strftime("%m-%d %H:%M", time.localtime(s["started"]))
+            live = " live" if not s["ended"] else ""
+            title = s.get("title") or ("" if s["name"] == s["id"] else s["name"])
+            rows.append(("%s  %s  %-22.22s %3dmsg %s%s" % (
+                s["id"], when, title, s["count"], s["source"], live),
+                ("session " + s["id"], span, s["started"], s["ended"],
+                 s.get("title") or s["name"])))
+        if not rows:
+            self.msg = "no Hermes sessions found"
+            return None
+        buf, sel, top = "", 0, 0
+        h, w = scr.getmaxyx()
+        bw = min(w - 4, 72)
+        maxrows = max(3, h - 8)
+        bh = min(len(rows), maxrows) + 5
+        top0, left = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        win = curses.newwin(bh, bw, top0, left)
+        win.keypad(True)
+        while True:
+            f = buf.lower()
+            view = [r for r in rows
+                    if not f or f in r[1][0].lower() or f in r[0].lower()]
+            sel = min(sel, max(0, len(view) - 1))
+            if sel < top:
+                top = sel
+            if sel >= top + maxrows:
+                top = sel - maxrows + 1
+            round_box(win, " session ")
+            for i in range(min(len(view), maxrows)):
+                txt, _val = view[top + i]
+                attr = self.cl["sel"] if top + i == sel else curses.A_NORMAL
+                try:
+                    win.addnstr(1 + i, 2, " %-*s" % (bw - 4, txt), bw - 4, attr)
+                except curses.error:
+                    pass
+            try:
+                win.addnstr(bh - 3, 2, "filter: %s" % buf, bw - 4, curses.A_BOLD)
+                win.addnstr(bh - 2, 2, "filter · move · pick · bksp back · esc",
+                            bw - 4, curses.A_DIM)
+            except curses.error:
+                pass
+            win.refresh()
+            try:
+                ch = win.getch()
+            except KeyboardInterrupt:
+                return None
+            if ch == 27:
+                if buf:
+                    buf, sel, top = "", 0, 0
+                else:
+                    return None
+            elif ch in (curses.KEY_ENTER, 10, 13):
+                return view[sel][1] if view else None
+            elif ch in (ord("j"), curses.KEY_DOWN):
+                sel = min(sel + 1, max(0, len(view) - 1))
+            elif ch in (ord("k"), curses.KEY_UP):
+                sel = max(sel - 1, 0)
+            elif ch in (curses.KEY_BACKSPACE, 263, 127, 8):
+                if buf:
+                    buf, sel, top = buf[:-1], 0, 0
+                else:
+                    return "BACK"
+            elif 32 <= ch <= 126:
+                buf, sel, top = buf + chr(ch), 0, 0
+            # other keys ignored
+
+    def show_stats(self, scr):
+        """Usage popup for the current selection (u key).
+
+        Right pane: the highlighted 'provider/model'. Left pane: the whole
+        provider. First picks a scope (time windows or Hermes sessions),
+        then shows an inspect-style result box.
+        """
+        if self.focus == "right":
+            mid, _meta = self.cur_model()
+            p = self.cur()
+            key = "%s/%s" % (p["name"], mid) if p and mid else None
+        else:
+            p = self.cur()
+            key = p["name"] if p else None
+        if not key:
+            self.msg = "nothing selected"
+            return
+        stage, spec, sub, title = "scope", None, "", ""
+        while True:
+            self.draw(scr)  # wipe the previous overlay so panels never stack
+            if stage == "scope":
+                scope = self.pick_window(scr, [("time", "time"), ("session", "session")],
+                                         " stats ", 0)
+                if not scope or scope == "BACK":
+                    return
+                stage = scope[1]
+                continue
+            if stage == "time":
+                picked = self.pick_window(scr, [(l, l) for l, _s in U.WINDOWS],
+                                          " window ", 6)
+                if not picked:
+                    return
+                if picked == "BACK":
+                    stage = "scope"
+                    continue
+                spec, sub, title = [picked[0]], picked[0], ""
+            else:
+                host, port = self._listen_base()
+                boot = U.session_cutoff(host, port, timeout=1)
+                picked = self.pick_session(
+                    scr, (time.time() - boot) if boot else None)
+                if not picked:
+                    return
+                if picked == "BACK":
+                    stage = "scope"
+                    continue
+                label, span, since, until = picked[:4]
+                title = picked[4] if len(picked) > 4 else ""
+                spec = [(label, span, since, until)]
+                if until is None:
+                    sub = "%s · since %s" % (
+                        label, time.strftime("%m-%d %H:%M", time.localtime(since)))
+                else:
+                    sub = "%s · %s → %s" % (
+                        label, time.strftime("%m-%d %H:%M", time.localtime(since)),
+                        time.strftime("%m-%d %H:%M", time.localtime(until)))
+            back = self.show_usage_result(scr, key, sub, title, spec)
+            if back:
+                stage = "time" if stage == "time" else "session"
+                continue
+            return
+
+    def show_usage_result(self, scr, key, sub, title, spec):
+        """Inspect-style usage box. Returns True when backspace asks to go
+        back to the picker, False on any other dismiss key."""
+        rows = U.summary_for(U.load(U.usage_path_for(self.path)), key, spec)
+        _label, st = rows[0]
+        if not st["reqs"]:
+            lines = [("usage", "no recorded usage (%s)" % sub)]
+        else:
+            pin, pout, cached, hit = U._row_cells(st)
+            reqs = "%d%s" % (st["reqs"], " (%d err)" % st["errs"] if st["errs"] else "")
+            lines = [
+                ("model", key),
+                ("scope", sub),
+            ]
+            if title:
+                lines.append(("title", title))
+            lines.extend([
+                ("reqs", reqs),
+                ("in", pin),
+                ("out", pout),
+                ("cached", cached),
+                ("hit", hit),
+            ])
+            if st["unknown"]:
+                lines.append(("", "%d req without token counts" % st["unknown"]))
+            lines.append(("", "requests during this span; overlapping"))
+            lines.append(("", "Hermes sessions share gateway traffic"))
+        h, w = scr.getmaxyx()
+        flat = []
+        for k, v in lines:
+            chunks = textwrap.wrap(v, max(10, w - 18)) or [""]
+            flat.append((k, chunks[0]))
+            flat.extend(("", c) for c in chunks[1:])
+        bw = min(w - 4, max(46, max(len("%-10s %s" % kv) for kv in flat) + 4))
+        bh = len(flat) + 4
+        top, left = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        win = curses.newwin(bh, bw, top, left)
+        round_box(win, " usage ")
+        for i, (k, v) in enumerate(flat):
+            try:
+                win.addnstr(1 + i, 2, "%-10s %s" % (k, v), bw - 4,
+                            curses.A_DIM if not k else curses.A_NORMAL)
+            except curses.error:
+                pass
+        try:
+            win.addnstr(bh - 2, 2, "backspace back · any key closes", bw - 4,
+                        curses.A_DIM)
+        except curses.error:
+            pass
+        win.refresh()
+        try:
+            ch = win.getch()
+        except KeyboardInterrupt:
+            return False
+        return ch in (curses.KEY_BACKSPACE, 263, 127, 8)
 
     def probe_all_avail(self, scr):
         """Availability-only pass over every model of the current provider.
@@ -957,9 +1322,21 @@ class Tui:
         self.draw(scr)
         # NOTE: save() reloads self.cfg, which would replace the dict we're
         # iterating — mutate in place and persist exactly once at the end.
-        for i, (mid, meta) in enumerate(sorted(models.items())):
-            self.busy = "availability %d/%d — %s" % (i + 1, total, mid[:40])
-            self.draw(scr)
+        scr.nodelay(True)
+        cancelled = False
+        done = 0
+        try:
+            for i, (mid, meta) in enumerate(sorted(models.items())):
+                try:
+                    ch = scr.getch()
+                except KeyboardInterrupt:
+                    ch = 27
+                if ch in (curses.KEY_BACKSPACE, 263, 127, 8, 27):
+                    cancelled = True
+                    break
+                self.busy = "availability %d/%d — %s (backspace cancels)" % (
+                    i + 1, total, mid[:40])
+                self.draw(scr)
             try:
                 avail, note = D.probe_availability(p["base_url"], mid, key, flavor)
             except Exception as e:  # noqa: BLE001 — a probe must never kill the pass
@@ -971,10 +1348,14 @@ class Tui:
                 ok += 1
             elif avail is False:
                 dead += 1
+            done += 1
+        finally:
+            scr.nodelay(False)
         self.save()
         self.busy = None
-        self.msg = "%s: %d ok, %d dead, %d inconclusive (%d models)" % (
-            p["name"], ok, dead, total - ok - dead, total)
+        self.msg = "%s: %d ok, %d dead, %d inconclusive (%d/%d models%s)" % (
+            p["name"], ok, dead, done - ok - dead, done, total,
+            ", cancelled" if cancelled else "")
 
     def revive(self, scr):
         """Ask the running server to clear dead/cooldown key state.
@@ -997,6 +1378,19 @@ class Tui:
             self.msg = "server has no key state for %s yet" % who
         else:
             self.msg = "revived keys: %s" % who
+
+    def refresh_all(self):
+        """F5: re-read the config from disk, re-probe gateway liveness,
+        clamp the cursor into range. For edits made outside the TUI."""
+        self.cfg = self._load_or_keep(self.cfg)
+        self._health = (None, 0.0)
+        n = len(self.provs())
+        self.sel = min(self.sel, max(0, n - 1))
+        self.msel, self.mtop = 0, 0
+        if self.load_error:
+            self.msg = "config unreadable — showing last good (%s)" % self.load_error
+        else:
+            self.msg = "reloaded (%d providers, gateway %s)" % (n, self._healthz())
 
     # ---------- main loop ----------
 
@@ -1050,10 +1444,7 @@ class Tui:
                 else:
                     self.inspect(scr)
             elif ch == ord("/"):
-                self.focus = "right"
-                self.filter = self.prompt(scr, "filter models: ")
-                self.msel = 0
-                self.mtop = 0
+                self.live_filter(scr)
             elif ch == ord("\t"):
                 self.focus = "right" if self.focus == "left" else "left"
             elif ch == ord("a"):
@@ -1096,6 +1487,10 @@ class Tui:
                     self.cfg["providers"].remove(p)
                     self.save()
                     self.sel = max(0, self.sel - 1)
+            elif ch == ord("u"):
+                self.show_stats(scr)
+            elif ch in (curses.KEY_F5, 18):
+                self.refresh_all()
 
 
 def main(path=None):

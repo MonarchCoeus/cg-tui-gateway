@@ -15,6 +15,7 @@ from . import config as C
 from . import http as H
 from . import keyring as K
 from . import translate as T
+from . import usage as U
 
 RETRY_STATUSES = (408, 409, 425, 429, 500, 502, 503, 504, 529)
 
@@ -37,6 +38,10 @@ class State:
         self.checked = time.time()
         self.recent = []
         self.reload_error = None
+        self.started = time.time()
+        self.ulock = threading.Lock()
+        self.usage_path = U.usage_path_for(self.path)
+        U.trim(self.usage_path)
 
     def refresh(self):
         """Return the current config, reloading if the file changed.
@@ -95,6 +100,15 @@ class State:
     def tail(self, n=20):
         with self.lock:
             return list(self.recent[-n:])
+
+    def record(self, entry):
+        """Ring buffer + persistent usage log. Usage appends are best-effort
+        and only for successes (failures carry no token counts). The file
+        append is serialized so a concurrent trim cannot drop lines."""
+        self.log(entry)
+        if entry.get("status") == 200:
+            with self.ulock:
+                U.append(self.usage_path, entry)
 
 
 def _upstream_url(provider, kind):
@@ -283,7 +297,8 @@ class Handler(BaseHTTPRequestHandler):
                     "keys": ring.summary(),
                 }
             )
-        out = {"ok": True, "providers": provs, "recent": self.state.tail()}
+        out = {"ok": True, "providers": provs, "recent": self.state.tail(),
+               "started": int(self.state.started)}
         if self.state.reload_error:
             # a corrupt config on disk is not fatal, but it must be visible
             out["ok"] = False
@@ -312,9 +327,21 @@ class Handler(BaseHTTPRequestHandler):
         body["model"] = upstream_model
         streaming = bool(body.get("stream"))
         anthropic = provider.get("flavor") == "anthropic"
-        payload = T.openai_to_anthropic(body) if (anthropic and kind == "chat") else body
-
-        url = _upstream_url(provider, kind)
+        meta = (provider.get("models") or {}).get(upstream_model) or {}
+        # responses-only models (flagged by inspect): chat in, /responses up
+        via_responses = kind == "chat" and not anthropic and meta.get("endpoint") == "responses"
+        if via_responses:
+            up_body = dict(body)
+            up_body.pop("stream", None)
+            payload = T.chat_to_responses(up_body)
+            url = provider["base_url"].rstrip("/") + "/responses"
+        else:
+            payload = T.openai_to_anthropic(body) if (anthropic and kind == "chat") else dict(body)
+            if streaming and not anthropic:
+                # ask for the trailing usage chunk; without it streamed
+                # replies have no token counts to record
+                payload.setdefault("stream_options", {"include_usage": True})
+            url = _upstream_url(provider, kind)
         last = None
         for attempt, idx in enumerate(order):
             key = ring.key_at(idx)
@@ -335,7 +362,7 @@ class Handler(BaseHTTPRequestHandler):
                     e.close()
                 ring.report_failure(idx, status)
                 last = (status, text)
-                self.state.log(
+                self.state.record(
                     {"t": started, "model": model_id, "key": ring.state[idx].label,
                      "status": status, "ms": int((time.time() - started) * 1000)}
                 )
@@ -345,17 +372,30 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 ring.report_failure(idx, 0)
                 last = (502, json.dumps({"error": {"message": repr(e)}}).encode())
-                self.state.log({"t": started, "model": model_id, "key": ring.state[idx].label,
+                self.state.record({"t": started, "model": model_id, "key": ring.state[idx].label,
                                 "status": 0, "ms": int((time.time() - started) * 1000)})
                 continue
 
             ring.report_success(idx)
-            self.state.log({"t": started, "model": model_id, "key": ring.state[idx].label,
-                            "status": 200, "ms": int((time.time() - started) * 1000)})
+            entry = {"t": started, "model": model_id, "key": ring.state[idx].label,
+                     "status": 200}
             with resp:
-                if streaming:
-                    return self._relay_stream(resp, anthropic and kind == "chat", model_id, attempt)
-                return self._relay_body(resp, anthropic and kind == "chat", model_id)
+                if via_responses:
+                    usage, status = self._relay_responses(resp, streaming, upstream_model)
+                elif streaming:
+                    usage, status = self._relay_stream(resp, anthropic and kind == "chat", model_id, attempt)
+                else:
+                    usage, status = self._relay_body(resp, anthropic and kind == "chat", model_id)
+            # ms covers the whole reply (streams included); usage lands on
+            # the same entry so /v1/logs and usage.jsonl always agree.
+            # A relay that answered with an error status (e.g. bad upstream
+            # payload) must not be recorded as a 200.
+            entry["status"] = status
+            entry["ms"] = int((time.time() - started) * 1000)
+            if usage:
+                entry.update(usage)
+            self.state.record(entry)
+            return
 
         status, text = last if last else (502, b'{"error":{"message":"no attempt made"}}')
         self.send_response(status)
@@ -366,11 +406,20 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(text)
 
     def _relay_body(self, resp, translate, model_id):
+        """Non-streaming reply; returns (usage dict, status)."""
         raw = resp.read()
+        usage = {}
         if translate:
             try:
                 obj = T.anthropic_to_openai(json.loads(raw.decode("utf-8", "replace")), model_id)
+                usage = U.extract_openai_usage(obj.get("usage"))
                 raw = json.dumps(obj).encode()
+            except ValueError:
+                pass
+        else:
+            try:
+                usage = U.extract_openai_usage(
+                    json.loads(raw.decode("utf-8", "replace")).get("usage"))
             except ValueError:
                 pass
         self.send_response(200)
@@ -378,8 +427,85 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+        return usage, 200
+
+    def _relay_responses(self, resp, streaming, model_id):
+        """Fold an upstream /responses object into a chat answer.
+
+        Non-streaming clients get a chat.completion; streaming clients get
+        a role chunk, a content chunk, a terminal finish_reason chunk, then
+        [DONE]. Returns (usage dict, http status answered to the client).
+        """
+        raw = resp.read()
+        try:
+            payload = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            self.send_response(502)
+            body = b'{"error":{"message":"bad /responses payload from upstream"}}'
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return {}, 502
+        usage = U.extract_responses_usage(payload.get("usage"))
+        try:
+            obj = T.responses_to_chat(payload, model_id)
+        except ValueError:
+            self.send_response(502)
+            body = b'{"error":{"message":"bad /responses payload from upstream"}}'
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return {}, 502
+        if not streaming:
+            data = json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return usage, 200
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        text = obj["choices"][0]["message"]["content"]
+        finish = obj["choices"][0].get("finish_reason") or "stop"
+        base = {"id": obj["id"], "object": "chat.completion.chunk",
+                "created": obj["created"], "model": obj["model"]}
+        role_chunk = dict(base, choices=[{"index": 0, "delta": {"role": "assistant"},
+                                          "finish_reason": None}])
+        self.wfile.write(b"data: " + json.dumps(role_chunk).encode() + b"\n\n")
+        if text:
+            body_chunk = dict(base, choices=[{"index": 0, "delta": {"content": text},
+                                              "finish_reason": None}])
+            self.wfile.write(b"data: " + json.dumps(body_chunk).encode() + b"\n\n")
+        for i, tc in enumerate(obj["choices"][0]["message"].get("tool_calls") or []):
+            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+            call_chunk = dict(base, choices=[{"index": 0, "delta": {"tool_calls": [{
+                "index": i, "id": tc.get("id"),
+                "type": "function",
+                "function": {"name": fn.get("name"), "arguments": fn.get("arguments") or ""},
+            }]}, "finish_reason": None}])
+            self.wfile.write(b"data: " + json.dumps(call_chunk).encode() + b"\n\n")
+        stop_chunk = dict(base, choices=[{"index": 0, "delta": {},
+                                          "finish_reason": finish}])
+        self.wfile.write(b"data: " + json.dumps(stop_chunk).encode() + b"\n\n")
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+        return usage, 200
 
     def _relay_stream(self, resp, translate, model_id, attempt):
+        """Forward an upstream SSE stream; returns (usage dict, status).
+
+        Passthrough bytes are forwarded untouched while a line buffer sniffs
+        for the trailing usage chunk (sent when stream_options.include_usage
+        was accepted). Translated anthropic streams report usage via the
+        translator instead.
+        """
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -404,13 +530,30 @@ class Handler(BaseHTTPRequestHandler):
             tail = tr.finish()
             if tail:
                 self.wfile.write(tail)
+            return tr.usage(), 200
         else:
+            usage = {}
+            buf = b""
             while True:
                 chunk = resp.read(2048)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
+                buf += chunk
+                *lines, buf = buf.split(b"\n")
+                for line in lines:
+                    line = line.strip()
+                    if not line.startswith(b"data:"):
+                        continue
+                    try:
+                        obj = json.loads(line[5:].decode("utf-8", "replace"))
+                    except ValueError:
+                        continue
+                    found = U.extract_chunk_usage(obj)
+                    if found:
+                        usage = found
+            return usage, 200
 
 
 def serve(path=None, host=None, port=None):

@@ -10,6 +10,8 @@ Usage:
   cg inspect NAME MODEL                   probe one model: reasoning/vision/availability
   cg status                               query a running gateway
   cg revive [NAME]                        un-kill keys a 401/403 marked dead
+  cg stats [--days N] [--by model|provider]
+                                          token usage: in/out, cache hits
 """
 
 import argparse
@@ -278,6 +280,48 @@ PROBED_FIELDS = ("reasoning", "reasoning_note", "vision", "vision_note",
                  "available", "available_note", "checked")
 
 
+def cmd_stats(args):
+    """Token usage from the persistent log: in/out, cache hits, per model."""
+    from cgw import usage as U
+
+    cfg_path = args.config or C.CONFIG_PATH
+    entries = U.load(U.usage_path_for(cfg_path))
+    if args.session:
+        match = None
+        for s in U.hermes_sessions():
+            if s["id"] == args.session or s["id"].startswith(args.session):
+                match = s
+                break
+        if not match:
+            print("no Hermes session %r" % args.session)
+            return 1
+        import time
+        span = (match["ended"] or time.time()) - match["started"]
+        if match["name"] != match["id"]:
+            print("session %s — %s" % (match["id"], match["name"]))
+        print(U.render(entries, by=args.by, window=(
+            "session " + match["id"], span, match["started"], match["ended"])))
+        return 0
+    if args.window:
+        if args.window == "session":
+            cfg = C.load(cfg_path)
+            listen = cfg.get("listen") or {}
+            host = args.host or listen.get("host", "127.0.0.1")
+            port = args.port or listen.get("port", C.DEFAULT_PORT)
+            import time
+            boot = U.session_cutoff(host, port)
+            if not boot:
+                print("gateway not running — session unknown")
+                return 1
+            print(U.render(entries, days=-1, by=args.by,
+                           window=("session", time.time() - boot)))
+        else:
+            print(U.render(entries, days=args.window, by=args.by))
+    else:
+        print(U.render(entries, days=args.days, by=args.by))
+    return 0
+
+
 def cmd_reset(args):
     """Forget every probed capability verdict for one model.
 
@@ -364,6 +408,22 @@ def main(argv=None):
     rs.add_argument("name")
     rs.add_argument("model")
     rs.set_defaults(fn=cmd_reset)
+
+    from cgw import usage as _U
+    us = sub.add_parser("stats", help="token usage: in/out, cache hits, per model")
+    us.add_argument("--window",
+                    choices=[l for l, _s in _U.WINDOWS] + ["session"],
+                    default=None,
+                    help="time window (default: --days value; session = this gateway run)")
+    us.add_argument("--days", type=int, default=7,
+                    help="window in days (default 7, ignored when --window is given)")
+    us.add_argument("--by", choices=["model", "provider"], default="model",
+                    help="group rows by model or provider (default model)")
+    us.add_argument("--session", default=None, metavar="ID",
+                    help="Hermes session id (prefix ok); stats for its span")
+    us.add_argument("--host", default=None)
+    us.add_argument("--port", type=int, default=None)
+    us.set_defaults(fn=cmd_stats)
 
     args = ap.parse_args(argv)
     if not getattr(args, "fn", None):
