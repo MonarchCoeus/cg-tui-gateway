@@ -1896,6 +1896,7 @@ class FakeScr:
 
 
 class TestPromptLive(unittest.TestCase):
+    @unittest.skipUnless(os.name != "nt", "curses unavailable on Windows")
     def test_on_change_fires_per_keystroke(self):
         from cgw.tui import Tui
 
@@ -1905,6 +1906,7 @@ class TestPromptLive(unittest.TestCase):
         self.assertEqual(got, "ac")
         self.assertEqual(seen, ["a", "ab", "a", "ac"])
 
+    @unittest.skipUnless(os.name != "nt", "curses unavailable on Windows")
     def test_no_callback_behaves_as_before(self):
         from cgw.tui import Tui
 
