@@ -222,6 +222,7 @@ first.
 
     GET  /v1/models            model list (includes context when known)
     POST /v1/chat/completions   streaming and non-streaming
+    POST /v1/responses          inbound Responses API, fulfilled via chat
     POST /v1/completions
     POST /v1/embeddings
     GET  /healthz               providers, key health, rotation

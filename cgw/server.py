@@ -219,7 +219,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/v1/logs", "/logs"):
             return self._logs()
         if path == "/":
-            return self._send_json(200, {"service": "cg", "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/logs", "/healthz"]})
+            return self._send_json(200, {"service": "cg", "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/responses", "/v1/logs", "/healthz"]})
         return self._error(404, "not found: %s" % path)
 
     def do_POST(self):
@@ -231,9 +231,15 @@ class Handler(BaseHTTPRequestHandler):
             "/chat/completions": "chat",
             "/v1/completions": "completions",
             "/v1/embeddings": "embeddings",
+            # inbound Responses API: fulfilled via the chat pipeline, so
+            # responses-only clients always get carried by /chat/completions
+            "/v1/responses": "responses",
+            "/responses": "responses",
         }
         if path not in kinds:
             return self._error(404, "not found: %s" % path)
+        if kinds[path] == "responses":
+            return self._proxy_responses()
         return self._proxy(kinds[path])
 
     def _revive(self):
@@ -428,6 +434,175 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
         return usage, 200
+
+    def _proxy_responses(self):
+        """Serve inbound POST /v1/responses via the chat pipeline.
+
+        Responses-only clients get a genuine response object; fulfillment
+        is always a chat call upstream (or the provider's own /responses
+        for responses-flagged models, passed through untouched). Streamed
+        requests are buffered upstream, then emitted as one output_text
+        delta + response.completed + [DONE] — never a bare [DONE] after
+        a null finish, which strict clients read as truncation.
+        """
+        body, err = self._read_body()
+        if err or body is None:
+            return self._error(400, err or "invalid request body")
+        model_id = body.get("model") or ""
+        if not model_id:
+            return self._error(400, "request is missing the 'model' field")
+        provider, upstream_model = self.state.route(model_id)
+        if provider is None:
+            return self._error(404, "no provider serves model %r" % model_id)
+        ring = self.state.registry.get(provider)
+        order = ring.try_order()
+        if not order:
+            return self._error(503, "provider %s has no usable keys" % provider["name"])
+        want_stream = bool(body.get("stream"))
+        anthropic = provider.get("flavor") == "anthropic"
+        meta = (provider.get("models") or {}).get(upstream_model) or {}
+        if not anthropic and meta.get("endpoint") == "responses":
+            payload = dict(body)
+            payload["model"] = upstream_model
+            payload.pop("stream", None)
+            url = provider["base_url"].rstrip("/") + "/responses"
+            status, raw, label, ms, started = self._dispatch(
+                provider, ring, order, url, payload, model_id)
+            if status != 200:
+                return self._send_upstream_error(status, raw, len(order))
+            try:
+                obj = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                return self._send_upstream_error(
+                    502, b'{"error":{"message":"bad /responses payload from upstream"}}', len(order))
+            if not isinstance(obj, dict) or obj.get("object") != "response":
+                return self._send_upstream_error(
+                    502, b'{"error":{"message":"bad /responses payload from upstream"}}', len(order))
+            usage = U.extract_responses_usage(obj.get("usage"))
+            return self._emit_response(obj, usage, want_stream, model_id, label, started)
+        chat = T.responses_in_to_chat(body)
+        chat["model"] = upstream_model
+        chat["stream"] = False
+        payload = T.openai_to_anthropic(chat) if anthropic else chat
+        url = _upstream_url(provider, "chat")
+        status, raw, label, ms, started = self._dispatch(
+            provider, ring, order, url, payload, model_id)
+        if status != 200:
+            return self._send_upstream_error(status, raw, len(order))
+        try:
+            data = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            return self._send_upstream_error(
+                502, b'{"error":{"message":"bad chat payload from upstream"}}', len(order))
+        try:
+            completion = T.anthropic_to_openai(data, upstream_model) if anthropic else data
+        except ValueError:
+            return self._send_upstream_error(
+                502, b'{"error":{"message":"bad chat payload from upstream"}}', len(order))
+        obj = T.chat_completion_to_responses(completion, model_id)
+        usage = U.extract_openai_usage((completion or {}).get("usage"))
+        return self._emit_response(obj, usage, want_stream, model_id, label, started)
+
+    def _dispatch(self, provider, ring, order, url, payload, model_id):
+        """POST payload to url trying each key in order.
+
+        Key-health accounting and per-attempt /v1/logs entries mirror
+        _proxy; the caller formats the client reply. Returns
+        (status, raw_bytes, key_label, ms, started).
+        """
+        last = None
+        started = time.time()
+        for idx in order:
+            key = ring.key_at(idx)
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode(),
+                headers=H.base_headers(dict(_auth_for(provider, key), **{"Content-Type": "application/json"})),
+                method="POST",
+            )
+            t0 = time.time()
+            try:
+                resp = urllib.request.urlopen(req, timeout=600)
+            except urllib.error.HTTPError as e:
+                status = e.code
+                try:
+                    text = e.read()
+                finally:
+                    e.close()
+                ring.report_failure(idx, status)
+                self.state.record(
+                    {"t": t0, "model": model_id, "key": ring.state[idx].label,
+                     "status": status, "ms": int((time.time() - t0) * 1000)}
+                )
+                last = (status, text, ring.state[idx].label)
+                if status in RETRY_STATUSES or status in K.DEAD_STATUSES:
+                    continue
+                break
+            except Exception as e:
+                ring.report_failure(idx, 0)
+                self.state.record(
+                    {"t": t0, "model": model_id, "key": ring.state[idx].label,
+                     "status": 0, "ms": int((time.time() - t0) * 1000)})
+                last = (502, json.dumps({"error": {"message": repr(e)}}).encode(),
+                        ring.state[idx].label)
+                continue
+            ring.report_success(idx)
+            label = ring.state[idx].label
+            with resp:
+                raw = resp.read()
+            return 200, raw, label, int((time.time() - t0) * 1000), t0
+        status, text, label = last if last else (
+            502, b'{"error":{"message":"no attempt made"}}', "?")
+        return status, text, label, int((time.time() - started) * 1000), started
+
+    def _send_upstream_error(self, status, text, tried):
+        """Relay an upstream failure raw (status + body), as _proxy does."""
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(text)))
+        self.send_header("X-CG-Keys-Tried", str(tried))
+        self.end_headers()
+        self.wfile.write(text)
+
+    def _emit_response(self, obj, usage, want_stream, model_id, label, started):
+        """Answer a response object as JSON or buffered SSE; log the hit."""
+        entry = {"t": started, "model": model_id, "key": label, "status": 200}
+        if usage:
+            entry.update(usage)
+        if not want_stream:
+            data = json.dumps(obj).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            entry["ms"] = int((time.time() - started) * 1000)
+            self.state.record(entry)
+            return
+        text = ""
+        msg_id = ""
+        for item in obj.get("output") or []:
+            if isinstance(item, dict) and item.get("type") == "message":
+                msg_id = item.get("id") or msg_id
+                for part in item.get("content") or []:
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        text += part.get("text") or ""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        if text:
+            self.wfile.write(b"data: " + json.dumps(
+                {"type": "response.output_text.delta", "item_id": msg_id,
+                 "output_index": 0, "content_index": 0, "delta": text}).encode() + b"\n\n")
+        self.wfile.write(b"data: " + json.dumps(
+            {"type": "response.completed", "response": obj}).encode() + b"\n\n")
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+        entry["ms"] = int((time.time() - started) * 1000)
+        self.state.record(entry)
 
     def _relay_responses(self, resp, streaming, model_id):
         """Fold an upstream /responses object into a chat answer.

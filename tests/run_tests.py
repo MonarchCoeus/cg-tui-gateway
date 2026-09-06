@@ -1097,6 +1097,62 @@ class TestTranslate(unittest.TestCase):
         self.assertEqual(got["usage"], {"prompt_tokens": 6, "completion_tokens": 3,
                                         "total_tokens": 9})
 
+    def test_responses_in_to_chat_string_input(self):
+        got = T.responses_in_to_chat({"model": "m", "input": "ping",
+                                      "instructions": "be brief",
+                                      "max_output_tokens": 7,
+                                      "temperature": 0.5})
+        self.assertEqual(got["messages"],
+                         [{"role": "system", "content": "be brief"},
+                          {"role": "user", "content": "ping"}])
+        self.assertEqual(got["max_tokens"], 7)
+        self.assertEqual(got["temperature"], 0.5)
+
+    def test_responses_in_to_chat_list_input_keeps_tools_and_images(self):
+        got = T.responses_in_to_chat({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "what is this"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AAA"}]},
+                {"type": "function_call_output", "call_id": "call_1",
+                 "output": "{\"t\": 1}"}],
+            "tools": [{"type": "function", "name": "get_time",
+                       "parameters": {"type": "object"}}],
+            "tool_choice": {"type": "function", "name": "get_time"}})
+        user = got["messages"][0]
+        self.assertEqual(user["role"], "user")
+        self.assertIn({"type": "text", "text": "what is this"}, user["content"])
+        self.assertIn({"type": "image_url",
+                       "image_url": {"url": "data:image/png;base64,AAA"}}, user["content"])
+        self.assertEqual(got["messages"][1]["role"], "tool")
+        self.assertEqual(got["messages"][1]["tool_call_id"], "call_1")
+        self.assertEqual(got["tools"], [{"type": "function",
+                                         "function": {"name": "get_time",
+                                                      "parameters": {"type": "object"}}}])
+        self.assertEqual(got["tool_choice"], {"type": "function",
+                                              "function": {"name": "get_time"}})
+
+    def test_chat_completion_to_responses_folds_text_and_calls(self):
+        completion = {"id": "chatcmpl-1", "model": "m",
+                      "choices": [{"index": 0, "finish_reason": "tool_calls",
+                                   "message": {"role": "assistant", "content": "one sec",
+                                               "tool_calls": [{"id": "call_2", "type": "function",
+                                                               "function": {"name": "get_time",
+                                                                            "arguments": "{}"}}]}}],
+                      "usage": {"prompt_tokens": 8, "completion_tokens": 4,
+                                "total_tokens": 12}}
+        got = T.chat_completion_to_responses(completion, "prov/m")
+        self.assertEqual(got["object"], "response")
+        self.assertEqual(got["model"], "prov/m")
+        self.assertEqual(got["status"], "completed")
+        kinds = [i["type"] for i in got["output"]]
+        self.assertEqual(kinds, ["message", "function_call"])
+        self.assertEqual(got["output"][1]["name"], "get_time")
+        self.assertEqual(got["output"][1]["call_id"], "call_2")
+        self.assertEqual(got["usage"], {"input_tokens": 8, "output_tokens": 4,
+                                        "total_tokens": 12})
+
     def test_stream_translation(self):
         tr = T.StreamTranslator("m")
         out = b""
@@ -1197,6 +1253,50 @@ class TestServer(ServerCase):
         self.assertIn("resp ok", r.text())
         self.assertIn('"finish_reason": "stop"', r.text())
         self.assertIn("[DONE]", r.text())
+
+    def test_responses_in_served_via_chat_upstream(self):
+        p = C.new_provider("bare", UPBASE + "/bare/v1", ["k"], flavor="openai")
+        p["models"] = {"bare-a": {}}
+        base = self.boot([p])
+        r = H.post(base + "/v1/responses",
+                   {"model": "bare/bare-a", "input": "ping"})
+        self.assertTrue(r.ok, r.text())
+        obj = r.json() or {}
+        self.assertEqual(obj["object"], "response")
+        self.assertEqual(obj["status"], "completed")
+        texts = "".join(part.get("text") or ""
+                        for item in obj["output"] if item.get("type") == "message"
+                        for part in item.get("content") or [])
+        self.assertIn("bare ok", texts)
+        r = H.get(base + "/v1/logs")
+        last = (r.json() or {}).get("entries", [])[-1]
+        self.assertEqual(last["status"], 200)
+        self.assertEqual(last["model"], "bare/bare-a")
+
+    def test_responses_in_streamed_emits_completed(self):
+        p = C.new_provider("bare", UPBASE + "/bare/v1", ["k"], flavor="openai")
+        p["models"] = {"bare-a": {}}
+        base = self.boot([p])
+        r = H.post(base + "/v1/responses",
+                   {"model": "bare/bare-a", "input": "ping", "stream": True})
+        self.assertTrue(r.ok, r.text())
+        self.assertIn("response.output_text.delta", r.text())
+        self.assertIn("response.completed", r.text())
+        self.assertIn("[DONE]", r.text())
+
+    def test_responses_in_passes_through_responses_upstream(self):
+        p = C.new_provider("resp", UPBASE + "/respondent/v1", ["k"], flavor="openai")
+        p["models"] = {"resp-a": {"endpoint": "responses"}}
+        base = self.boot([p])
+        r = H.post(base + "/v1/responses",
+                   {"model": "resp/resp-a", "input": "ping",
+                    "tools": [{"type": "function", "name": "get_time"}]})
+        self.assertTrue(r.ok, r.text())
+        obj = r.json() or {}
+        self.assertEqual(obj["object"], "response")
+        names = [i.get("name") for i in obj["output"]
+                 if i.get("type") == "function_call"]
+        self.assertIn("get_time", names)
 
     def test_logs_endpoint_records_key(self):
         p = C.new_provider("logs", UPBASE + "/logs/v1", ["k1", "k2"],

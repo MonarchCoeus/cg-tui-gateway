@@ -527,3 +527,138 @@ def responses_to_chat(payload, model):
             "total_tokens": prompt + completion,
         },
     }
+
+
+def responses_in_to_chat(body):
+    """Build a chat request from an inbound Responses-API request.
+
+    Lets clients that only speak POST /v1/responses ride the chat pipeline:
+    string/list input folds to messages, instructions become the system
+    prompt, images stay structured (image_url parts), tool traffic keeps
+    its shape (function_call_output -> role:tool). Token/temperature/tool
+    knobs map; responses-only params (store, background, previous id)
+    are dropped — fulfillment is always a fresh chat call.
+    """
+    msgs = []
+    instr = body.get("instructions")
+    if isinstance(instr, str) and instr.strip():
+        msgs.append({"role": "system", "content": instr})
+    raw = body.get("input", "")
+    items = raw if isinstance(raw, list) else [raw]
+    for it in items:
+        if isinstance(it, str):
+            if it.strip():
+                msgs.append({"role": "user", "content": it})
+            continue
+        if not isinstance(it, dict):
+            continue
+        t = it.get("type")
+        if t == "message":
+            role = it.get("role")
+            if role == "developer":
+                role = "system"
+            if role not in ("user", "assistant", "system"):
+                role = "user"
+            text, images = "", []
+            for part in it.get("content") or []:
+                if not isinstance(part, dict):
+                    continue
+                pt = part.get("type")
+                if pt in ("input_text", "text") and part.get("text"):
+                    text += part["text"]
+                elif pt == "input_image" and part.get("image_url"):
+                    images.append(part["image_url"])
+            if images:
+                content = []
+                if text:
+                    content.append({"type": "text", "text": text})
+                content.extend({"type": "image_url", "image_url": {"url": u}}
+                               for u in images if isinstance(u, str) and u)
+                msgs.append({"role": role, "content": content})
+            elif text:
+                msgs.append({"role": role, "content": text})
+        elif t == "function_call_output":
+            out = it.get("output")
+            msgs.append({"role": "tool",
+                         "content": out if isinstance(out, str) else json.dumps(out or ""),
+                         "tool_call_id": it.get("call_id") or it.get("id") or ""})
+        elif t == "function_call" and it.get("name"):
+            msgs.append({"role": "assistant",
+                         "content": "called %s(%s)" % (it["name"], it.get("arguments") or "")})
+        # reasoning / other item types carry no chat-visible content: skip
+    if not msgs:
+        msgs = [{"role": "user", "content": "hi"}]
+    out = {"model": body.get("model"), "messages": msgs}
+    want = body.get("max_output_tokens")
+    if want not in (None, 0, ""):
+        out["max_tokens"] = want
+    for key in ("temperature", "top_p"):
+        if body.get(key) is not None:
+            out[key] = body[key]
+    ctools = []
+    for t in body.get("tools") or []:
+        if not isinstance(t, dict) or t.get("type") != "function" or not t.get("name"):
+            continue
+        f = {"name": t["name"]}
+        for k in ("description", "parameters", "strict"):
+            if t.get(k) is not None:
+                f[k] = t[k]
+        ctools.append({"type": "function", "function": f})
+    if ctools:
+        out["tools"] = ctools
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict):
+        if choice.get("type") == "function" and choice.get("name"):
+            out["tool_choice"] = {"type": "function",
+                                  "function": {"name": choice["name"]}}
+        elif choice.get("type") in ("auto", "none", "required"):
+            out["tool_choice"] = choice["type"]
+    elif choice in ("auto", "none", "required"):
+        out["tool_choice"] = choice
+    if body.get("parallel_tool_calls") is not None:
+        out["parallel_tool_calls"] = bool(body.get("parallel_tool_calls"))
+    return out
+
+
+def chat_completion_to_responses(completion, model):
+    """Fold a chat.completion into a Responses-API response object.
+
+    Text becomes the message item, chat tool_calls become function_call
+    items (finish tool_calls reads as completed with calls to run, never
+    as a clean stop with nothing to do).
+    """
+    choice = ((completion or {}).get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    content = msg.get("content")
+    if isinstance(content, list):
+        text = "".join(p.get("text") or ""
+                       for p in content
+                       if isinstance(p, dict) and p.get("type") in ("text", "output_text"))
+    else:
+        text = content if isinstance(content, str) else ""
+    output = [{"type": "message", "id": "msg_%s" % uuid.uuid4().hex[:12],
+               "status": "completed", "role": "assistant",
+               "content": [{"type": "output_text", "text": text, "annotations": []}]}]
+    for tc in msg.get("tool_calls") or []:
+        fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+        if not fn.get("name"):
+            continue
+        args = fn.get("arguments")
+        cid = (tc.get("id") if isinstance(tc, dict) else None) or "call_%d" % len(output)
+        output.append({"type": "function_call", "id": cid, "call_id": cid,
+                       "name": fn["name"],
+                       "arguments": args if isinstance(args, str) else json.dumps(args or {})})
+    finish = choice.get("finish_reason") or "stop"
+    usage = (completion or {}).get("usage") or {}
+    pin = usage.get("prompt_tokens", 0)
+    pout = usage.get("completion_tokens", 0)
+    return {
+        "id": "resp_%s" % uuid.uuid4().hex[:24],
+        "object": "response",
+        "created_at": int(time.time()),
+        "model": model,
+        "status": "completed" if finish in ("stop", "tool_calls") else "incomplete",
+        "output": output,
+        "usage": {"input_tokens": pin, "output_tokens": pout,
+                  "total_tokens": pin + pout},
+    }
