@@ -320,7 +320,7 @@ class Tui:
 
             if ch in ("\n", "\r", curses.KEY_ENTER, 10, 13):
                 break
-            if ch == "\x1b":  # ESC cancels
+            if ch in ("\x1b", 27):  # ESC cancels (keypad(True) delivers 27)
                 return ""
             before = "".join(buf) if on_change is not None else None
             if ch in ("\x7f", "\b", curses.KEY_BACKSPACE, 263, 127, 8):
