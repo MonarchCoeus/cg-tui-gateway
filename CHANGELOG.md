@@ -2,6 +2,12 @@
 
 All notable changes to CG — AI TUI Gateway. Format follows [Keep a Changelog](https://keepachangelog.com/), versions follow [SemVer](https://semver.org/).
 
+## [1.1.2] — 2026-09-06
+
+### Fixed
+
+- TUI: ESC now cancels prompts and clears the model filter — `keypad(True)` delivers ESC as integer 27, but the prompt only matched the string form, so ESC silently did nothing and users had to backspace the filter text away to escape
+
 ## [1.1.1] — 2026-09-06
 
 ### Added
