@@ -2,6 +2,12 @@
 
 All notable changes to CG — AI TUI Gateway. Format follows [Keep a Changelog](https://keepachangelog.com/), versions follow [SemVer](https://semver.org/).
 
+## [1.1.1] — 2026-09-06
+
+### Added
+
+- Inbound Responses API: `POST /v1/responses` (and `/responses`) served through the chat pipeline, so responses-only clients are always carried by `/chat/completions` — string/list input, `instructions`, images, and tools cross both ways; responses-flagged upstream models pass through untouched; `stream: true` returns one text delta + `response.completed` + `[DONE]`
+
 ## [1.1.0] — 2026-09-04
 
 ### Added
