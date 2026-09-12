@@ -1108,6 +1108,30 @@ class TestTranslate(unittest.TestCase):
         self.assertEqual(got["max_tokens"], 7)
         self.assertEqual(got["temperature"], 0.5)
 
+    def test_responses_in_to_chat_untyped_items_are_messages(self):
+        """Untyped {role, content} items must convert, not vanish.
+
+        Hermes' codex transport omits "type" on input items. Skipping them
+        dropped the whole user turn, leaving instructions-only payloads
+        that upstream rejected with 400 "last message must have role=user"
+        — every webui/CLI turn to a chat-only upstream died.
+        """
+        got = T.responses_in_to_chat({
+            "model": "m", "instructions": "sys",
+            "input": [{"role": "user", "content": "hi"},
+                      {"role": "assistant", "content": "hello"},
+                      {"role": "user", "content": "again"}]})
+        self.assertEqual(got["messages"],
+                         [{"role": "system", "content": "sys"},
+                          {"role": "user", "content": "hi"},
+                          {"role": "assistant", "content": "hello"},
+                          {"role": "user", "content": "again"}])
+        # a trailing assistant turn must never be the last message
+        got2 = T.responses_in_to_chat({
+            "model": "m", "instructions": "sys",
+            "input": [{"role": "assistant", "content": "hello"}]})
+        self.assertEqual(got2["messages"][-1]["role"], "user")
+
     def test_responses_in_to_chat_list_input_keeps_tools_and_images(self):
         got = T.responses_in_to_chat({
             "model": "m",

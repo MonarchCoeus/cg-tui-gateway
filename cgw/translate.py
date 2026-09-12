@@ -553,14 +553,23 @@ def responses_in_to_chat(body):
         if not isinstance(it, dict):
             continue
         t = it.get("type")
-        if t == "message":
+        # Untyped items ARE messages: Hermes' own codex transport sends
+        # {"role": "user", "content": "..."} with no "type" field, and
+        # skipping those dropped the entire user turn, leaving only the
+        # system instructions — upstream then 400s "last message must have
+        # role=user" (the reply never happens at all).
+        if t in (None, "message") and it.get("role") is not None:
             role = it.get("role")
             if role == "developer":
                 role = "system"
             if role not in ("user", "assistant", "system"):
                 role = "user"
             text, images = "", []
-            for part in it.get("content") or []:
+            content = it.get("content")
+            # content may be a plain string (untyped item) or a parts list
+            if isinstance(content, str):
+                text = content
+            for part in content if isinstance(content, list) else []:
                 if not isinstance(part, dict):
                     continue
                 pt = part.get("type")
@@ -588,6 +597,12 @@ def responses_in_to_chat(body):
         # reasoning / other item types carry no chat-visible content: skip
     if not msgs:
         msgs = [{"role": "user", "content": "hi"}]
+    # A Responses transcript can legitimately end on an assistant item (a
+    # client resuming a turn). Chat-only upstreams hard-reject that with
+    # 400 "last message must have role=user", so nudge instead of failing
+    # the whole request.
+    elif msgs[-1]["role"] == "assistant":
+        msgs.append({"role": "user", "content": "Continue."})
     out = {"model": body.get("model"), "messages": msgs}
     want = body.get("max_output_tokens")
     if want not in (None, 0, ""):
