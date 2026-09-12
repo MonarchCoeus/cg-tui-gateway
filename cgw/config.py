@@ -6,7 +6,9 @@ No env-var indirection: keys live in the file.
 
 import json
 import os
+import shutil
 import tempfile
+import time
 
 CONFIG_DIR = os.path.expanduser("~/.config/cg")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -294,3 +296,90 @@ def merge_models(old, new):
             # must not silently resurrect it as enabled again)
             out[mid] = dict(meta)
     return out
+
+
+BACKUP_PREFIX = "config-"
+PRE_RESTORE_PREFIX = "config-pre-restore-"
+BACKUP_SUFFIX = ".json"
+
+
+def backup_dir(path=None):
+    """Directory holding timestamped copies of the config file."""
+    path = path or CONFIG_PATH
+    return os.path.join(os.path.dirname(os.path.abspath(path)), "backups")
+
+
+def _unique(dest):
+    """Append -2, -3, ... if two backups land in the same second."""
+    if not os.path.exists(dest):
+        return dest
+    base, ext = os.path.splitext(dest)
+    i = 2
+    while os.path.exists("%s-%d%s" % (base, i, ext)):
+        i += 1
+    return "%s-%d%s" % (base, i, ext)
+
+
+def backup_config(path=None, dest=None):
+    """Copy the config to a timestamped backup, mode 0600. Returns the path.
+
+    Refuses a corrupt source: backing up garbage over a good history
+    helps nobody, and load() raising tells the caller why.
+    """
+    path = path or CONFIG_PATH
+    load(path)
+    d = backup_dir(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    if dest is None:
+        dest = os.path.join(d, "%s%s%s" % (BACKUP_PREFIX, time.strftime("%Y%m%d-%H%M%S"), BACKUP_SUFFIX))
+    dest = _unique(dest)
+    shutil.copyfile(path, dest)
+    os.chmod(dest, 0o600)
+    return dest
+
+
+def list_backups(path=None):
+    """Backup files, newest first (timestamps sort lexicographically)."""
+    d = backup_dir(path)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    outs = [os.path.join(d, n) for n in names
+            if n.startswith(BACKUP_PREFIX) and n.endswith(BACKUP_SUFFIX)
+            and os.path.isfile(os.path.join(d, n))]
+    outs.sort(reverse=True)
+    return outs
+
+
+def latest_backup(path=None, include_pre_restore=False):
+    """Newest backup, or None. Pre-restore safety copies only count if asked."""
+    for b in list_backups(path):
+        if include_pre_restore or not os.path.basename(b).startswith(PRE_RESTORE_PREFIX):
+            return b
+    return None
+
+
+def restore_config(path=None, src=None):
+    """Restore the config from a backup. Returns the safety-copy path.
+
+    The current file is backed up first (config-pre-restore-<stamp>.json),
+    so a restore is never a one-way door. Refuses a corrupt backup.
+    """
+    path = path or CONFIG_PATH
+    if src is None:
+        src = latest_backup(path)
+        if src is None:
+            raise ConfigError("no backups for %s yet" % path)
+    load(src)
+    pre = None
+    if os.path.exists(path):
+        load(path)  # a corrupt live file is reported, not paved over blindly
+        d = backup_dir(path)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        pre = _unique(os.path.join(d, "%s%s%s" % (PRE_RESTORE_PREFIX, time.strftime("%Y%m%d-%H%M%S"), BACKUP_SUFFIX)))
+        shutil.copyfile(path, pre)
+        os.chmod(pre, 0o600)
+    shutil.copyfile(src, path)
+    os.chmod(path, 0o600)
+    return pre

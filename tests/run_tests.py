@@ -1192,6 +1192,83 @@ class TestTranslate(unittest.TestCase):
         self.assertIn('"finish_reason": "tool_calls"', text)
 
 
+class TestBackup(unittest.TestCase):
+    def _cfg(self, d, name="p1"):
+        path = os.path.join(d, "config.json")
+        cfg = C.default_config()
+        p = C.new_provider(name, "http://x/v1", ["k1", "k2"])
+        p["models"] = {"m1": {"reasoning": True}}
+        cfg["providers"].append(p)
+        C.save(cfg, path)
+        return path
+
+    def test_backup_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._cfg(d)
+            dest = C.backup_config(path)
+            self.assertTrue(os.path.isfile(dest))
+            self.assertEqual(oct(os.stat(dest).st_mode)[-3:], "600")
+            self.assertEqual(C.load(dest)["providers"], C.load(path)["providers"])
+
+    def test_backup_refuses_corrupt(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "config.json")
+            with open(path, "w") as fh:
+                fh.write("{not json")
+            with self.assertRaises(C.ConfigError):
+                C.backup_config(path)
+            self.assertEqual(C.list_backups(path), [])
+
+    def test_list_backups_newest_first(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._cfg(d)
+            first = C.backup_config(path, os.path.join(C.backup_dir(path), "config-20200101-000000.json"))
+            second = C.backup_config(path, os.path.join(C.backup_dir(path), "config-20210101-000000.json"))
+            self.assertEqual(C.list_backups(path), [second, first])
+            self.assertEqual(C.latest_backup(path), second)
+
+    def test_restore_roundtrip_keeps_safety_copy(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._cfg(d, "orig")
+            snap = C.backup_config(path)
+            cfg = C.load(path)
+            cfg["providers"][0]["name"] = "changed"
+            C.save(cfg, path)
+            pre = C.restore_config(path, snap)
+            self.assertTrue(pre and os.path.isfile(pre))
+            self.assertEqual(C.load(path)["providers"][0]["name"], "orig")
+            self.assertEqual(C.load(pre)["providers"][0]["name"], "changed")
+
+    def test_restore_defaults_to_latest(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._cfg(d, "v1")
+            C.backup_config(path, os.path.join(C.backup_dir(path), "config-20200101-000000.json"))
+            cfg = C.load(path)
+            cfg["providers"][0]["name"] = "v2"
+            C.save(cfg, path)
+            C.backup_config(path, os.path.join(C.backup_dir(path), "config-20210101-000000.json"))
+            cfg["providers"][0]["name"] = "v3"
+            C.save(cfg, path)
+            C.restore_config(path)
+            self.assertEqual(C.load(path)["providers"][0]["name"], "v2")
+
+    def test_restore_no_backups_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._cfg(d)
+            with self.assertRaises(C.ConfigError):
+                C.restore_config(path)
+
+    def test_restore_refuses_corrupt_src(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._cfg(d)
+            bad = os.path.join(d, "bad.json")
+            with open(bad, "w") as fh:
+                fh.write("{nope")
+            with self.assertRaises(C.ConfigError):
+                C.restore_config(path, bad)
+            self.assertEqual(C.load(path)["providers"][0]["name"], "p1")
+
+
 class ServerCase(unittest.TestCase):
     """Boots a real CG instance against the fake upstream."""
 

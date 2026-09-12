@@ -101,6 +101,7 @@ gateway picks them up on the next request — no restart needed.
     t  enable/disable        l  open a live log terminal (new window)
     T  toggle all models     S  restart server (re-exec in place)
     u  usage for the selection (time windows or Hermes sessions)
+    b  backup providers + keys      B  restore from backup
     ?  full keymap overlay
     j/k  move      ENTER  inspect the highlighted model
     c  set/clear its context window      tab  switch pane

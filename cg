@@ -11,6 +11,8 @@ Usage:
   cg status                               query a running gateway
   cg revive [NAME]                        un-kill keys a 401/403 marked dead
   cg restart                              re-exec the running gateway in place
+  cg backup [--dest PATH]                 timestamped copy of providers + keys
+  cg restore [FILE|--latest]              restore from backup (current saved first)
   cg stats [--days N] [--by model|provider]
                                           token usage: in/out, cache hits
 """
@@ -213,6 +215,40 @@ def cmd_restart(args):
     return 0
 
 
+def cmd_backup(args):
+    try:
+        dest = C.backup_config(args.config, args.dest)
+    except C.ConfigError as e:
+        print("backup failed: %s" % e)
+        return 1
+    print("backup saved: %s" % dest)
+    return 0
+
+
+def cmd_restore(args):
+    src = args.file or (C.latest_backup(args.config) if args.latest else None)
+    if src is None:
+        known = C.list_backups(args.config)
+        if not known:
+            print("no backups yet — run 'cg backup' first")
+        else:
+            print("backups for %s (newest first):" % (args.config or C.CONFIG_PATH))
+            for b in known:
+                print("  %s" % b)
+            print("run 'cg restore FILE' or 'cg restore --latest'")
+        return 1
+    try:
+        pre = C.restore_config(args.config, src)
+    except C.ConfigError as e:
+        print("restore failed: %s" % e)
+        return 1
+    if pre:
+        print("restored %s (previous config saved as %s)" % (src, pre))
+    else:
+        print("restored %s" % src)
+    return 0
+
+
 def _parse_tokens(s):
     """Accept '128000', '128k', '1m'. Returns int or None if unparseable."""
     s = (s or "").strip().lower().replace("_", "")
@@ -410,6 +446,15 @@ def main(argv=None):
     rt.add_argument("--host", default=None)
     rt.add_argument("--port", type=int, default=None)
     rt.set_defaults(fn=cmd_restart)
+
+    bk = sub.add_parser("backup", help="save a timestamped copy of providers + keys")
+    bk.add_argument("--dest", default=None, help="exact file to write (default: backups/config-<stamp>.json)")
+    bk.set_defaults(fn=cmd_backup)
+
+    rs2 = sub.add_parser("restore", help="restore providers + keys from a backup (current config saved first)")
+    rs2.add_argument("file", nargs="?", default=None, help="backup file (omit with --latest)")
+    rs2.add_argument("--latest", action="store_true", help="restore the newest backup")
+    rs2.set_defaults(fn=cmd_restore)
 
     tg = sub.add_parser("toggle", help="enable/disable a provider")
     tg.add_argument("name")

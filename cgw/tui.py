@@ -581,7 +581,7 @@ class Tui:
                          ("r", "refresh"), ("t", "on/off"), ("T", "all-models"),
                          ("j/k", "move"), ("ENTER", "inspect"), ("c", "context"),
                          ("x", "reset"), ("m", "add"), ("/", "find"), ("A", "avail-all"),
-                         ("u", "usage"),
+                         ("u", "usage"), ("b", "backup"), ("B", "restore"),
                          ("R", "revive"), ("S", "restart"), ("l", "logs"), ("tab", "switch"),
                          ("F5", "refresh"), ("?", "help"), ("q", "quit")]
                 if y < h - 2:
@@ -1031,7 +1031,8 @@ class Tui:
             ("right", "A:avail-all (one call per model) · c:context"),
             ("right", "x:reset m:add /:find-as-you-type u:usage"),
             ("both", "TAB/←→  switch pane · R:revive · S:restart"),
-            ("both", "F5 refresh · l:live-log · ?:help · q/ESC quit"),
+            ("both", "b:backup · B:restore · F5 refresh · l:live-log"),
+            ("both", "?:help · q/ESC quit"),
         ]
         bw = min(w - 4, 62)
         bh = len(rows) + 4
@@ -1442,6 +1443,48 @@ class Tui:
             time.sleep(0.3)
         return False
 
+    def backup_now(self):
+        """'b' — timestamped copy of providers + keys next to the config."""
+        try:
+            dest = C.backup_config(self.path)
+        except C.ConfigError as e:
+            self.msg = "backup failed (%s)" % e
+            return
+        self.msg = "backup saved: %s" % os.path.basename(dest)
+
+    def restore_backup(self, scr):
+        """'B' — pick a backup, confirm, restore it over the live config.
+
+        The current file is saved as a pre-restore copy first, and the
+        TUI reloads from disk so the panes show what was restored.
+        """
+        known = C.list_backups(self.path)
+        if not known:
+            self.msg = "no backups yet (press b first)"
+            return
+        picked = self.pick_window(scr, [(os.path.basename(b), b) for b in known],
+                                  title=" restore backup ", sel=0)
+        if not picked:
+            return
+        _label, src = picked
+        if not self.confirm(scr, "restore %s?" % os.path.basename(src)):
+            return
+        try:
+            pre = C.restore_config(self.path, src)
+        except C.ConfigError as e:
+            self.msg = "restore failed (%s)" % e
+            return
+        self.cfg = self._load_or_keep(self.cfg)
+        self._health = (None, 0.0)
+        n = len(self.provs())
+        self.sel = min(self.sel, max(0, n - 1))
+        self.msel, self.mtop = 0, 0
+        if pre:
+            self.msg = "restored %s (previous saved as %s)" % (
+                os.path.basename(src), os.path.basename(pre))
+        else:
+            self.msg = "restored %s" % os.path.basename(src)
+
     def refresh_all(self):
         """F5: re-read the config from disk, re-probe gateway liveness,
         clamp the cursor into range. For edits made outside the TUI."""
@@ -1542,6 +1585,10 @@ class Tui:
                 self.revive(scr)
             elif ch == ord("S"):
                 self.restart_server(scr)
+            elif ch == ord("b"):
+                self.backup_now()
+            elif ch == ord("B"):
+                self.restore_backup(scr)
             elif ch == ord("l"):
                 self.open_logs(scr)
             elif ch == ord("?"):
