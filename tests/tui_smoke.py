@@ -89,6 +89,7 @@ def main():
         ("capability column", "rsn"),
         ("capability value", "✓"),
         ("bindings (right pane)", "a: add"),
+        ("bindings (right pane)", "S: restart"),
         ("bindings (right pane)", "ENTER: inspect"),
         ("bindings (right pane)", "c: context"),
         ("bindings (right pane)", "l: logs"),

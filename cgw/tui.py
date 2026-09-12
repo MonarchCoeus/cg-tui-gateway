@@ -582,7 +582,7 @@ class Tui:
                          ("j/k", "move"), ("ENTER", "inspect"), ("c", "context"),
                          ("x", "reset"), ("m", "add"), ("/", "find"), ("A", "avail-all"),
                          ("u", "usage"),
-                         ("R", "revive"), ("l", "logs"), ("tab", "switch"),
+                         ("R", "revive"), ("S", "restart"), ("l", "logs"), ("tab", "switch"),
                          ("F5", "refresh"), ("?", "help"), ("q", "quit")]
                 if y < h - 2:
                     scr.addnstr(y, insp_x + 1, "keys", insp_w - 2, curses.A_NORMAL)
@@ -1030,8 +1030,8 @@ class Tui:
             ("right", "j/k  move · ENTER:inspect t:on/off T:all-models"),
             ("right", "A:avail-all (one call per model) · c:context"),
             ("right", "x:reset m:add /:find-as-you-type u:usage"),
-            ("both", "TAB/←→  switch pane · R:revive keys · ?:this help"),
-            ("both", "F5 refresh from disk · l:live-log · q or ESC quit"),
+            ("both", "TAB/←→  switch pane · R:revive · S:restart"),
+            ("both", "F5 refresh · l:live-log · ?:help · q/ESC quit"),
         ]
         bw = min(w - 4, 62)
         bh = len(rows) + 4
@@ -1379,6 +1379,24 @@ class Tui:
         else:
             self.msg = "revived keys: %s" % who
 
+    def restart_server(self, scr):
+        """Ask the running server to re-exec itself in place.
+
+        Fresh config, clean key state, new code live — and this TUI
+        process is untouched, so quit/relaunch it separately if the
+        TUI code itself changed.
+        """
+        if not self.confirm(scr, "restart gateway?"):
+            return
+        listen = self.cfg.get("listen") or {}
+        base = "http://%s:%s" % (listen.get("host", "127.0.0.1"), listen.get("port", C.DEFAULT_PORT))
+        r = H.post(base + "/v1/restart", {}, timeout=5)
+        if not r.ok:
+            self.msg = "server not running (%s)" % (r.status or r.error)
+            return
+        self._health = (None, 0.0)
+        self.msg = "restarting gateway..."
+
     def refresh_all(self):
         """F5: re-read the config from disk, re-probe gateway liveness,
         clamp the cursor into range. For edits made outside the TUI."""
@@ -1477,6 +1495,8 @@ class Tui:
                 self.probe_all_avail(scr)
             elif ch == ord("R"):
                 self.revive(scr)
+            elif ch == ord("S"):
+                self.restart_server(scr)
             elif ch == ord("l"):
                 self.open_logs(scr)
             elif ch == ord("?"):

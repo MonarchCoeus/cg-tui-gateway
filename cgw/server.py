@@ -4,6 +4,8 @@ No inbound auth: binds loopback only. Anything on this box can use it.
 """
 
 import json
+import os
+import sys
 import threading
 import time
 import urllib.error
@@ -24,6 +26,22 @@ MAX_BODY_BYTES = 32 * 1024 * 1024
 
 # don't stat the config file more than this often (seconds)
 MTIME_CHECK_INTERVAL = 1.0
+
+
+# delay between acknowledging /v1/restart and re-execing, so the 200
+# flushes to the client before the process image is replaced.
+RESTART_DELAY = 0.5
+
+
+def _reexec():
+    """Replace this process with a fresh `cg serve` (same argv)."""
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def _schedule_restart():
+    t = threading.Timer(RESTART_DELAY, _reexec)
+    t.daemon = True
+    t.start()
 
 
 class State:
@@ -219,13 +237,15 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/v1/logs", "/logs"):
             return self._logs()
         if path == "/":
-            return self._send_json(200, {"service": "cg", "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/responses", "/v1/logs", "/healthz"]})
+            return self._send_json(200, {"service": "cg", "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/responses", "/v1/logs", "/healthz", "/v1/restart"]})
         return self._error(404, "not found: %s" % path)
 
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path in ("/v1/revive", "/revive"):
             return self._revive()
+        if path in ("/v1/restart", "/restart"):
+            return self._restart()
         kinds = {
             "/v1/chat/completions": "chat",
             "/chat/completions": "chat",
@@ -257,6 +277,14 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True, "revived": n,
                               "provider": name or "all",
                               "keys": self.state.registry.snapshot()})
+
+    def _restart(self):
+        """Re-exec the server in place: fresh config, clean key state,
+        new code live. Responds 200 first; the process image is replaced
+        RESTART_DELAY later so the reply flushes before the exec.
+        """
+        self._send_json(200, {"ok": True, "pid": os.getpid()})
+        _schedule_restart()
 
     def _models(self):
         out = []

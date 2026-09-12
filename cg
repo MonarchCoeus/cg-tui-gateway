@@ -10,6 +10,7 @@ Usage:
   cg inspect NAME MODEL                   probe one model: reasoning/vision/availability
   cg status                               query a running gateway
   cg revive [NAME]                        un-kill keys a 401/403 marked dead
+  cg restart                              re-exec the running gateway in place
   cg stats [--days N] [--by model|provider]
                                           token usage: in/out, cache hits
 """
@@ -195,6 +196,20 @@ def cmd_revive(args):
         return 1
     data = r.json() or {}
     print("revived %s (%d ring(s))" % (data.get("provider", "all"), data.get("revived", 0)))
+    return 0
+
+
+def cmd_restart(args):
+    cfg = C.load(args.config)
+    listen = cfg.get("listen") or {}
+    host = args.host or listen.get("host", "127.0.0.1")
+    port = args.port or listen.get("port", C.DEFAULT_PORT)
+    url = "http://%s:%s/v1/restart" % (host, port)
+    r = H.post(url, {}, timeout=10)
+    if not r.ok:
+        print("gateway not reachable at %s (%s)" % (url, r.status or r.error))
+        return 1
+    print("restarting gateway (pid %s)" % (r.json() or {}).get("pid", "?"))
     return 0
 
 
@@ -390,6 +405,11 @@ def main(argv=None):
     rv.add_argument("--host", default=None)
     rv.add_argument("--port", type=int, default=None)
     rv.set_defaults(fn=cmd_revive)
+
+    rt = sub.add_parser("restart", help="re-exec a running gateway in place (fresh config, clean keys)")
+    rt.add_argument("--host", default=None)
+    rt.add_argument("--port", type=int, default=None)
+    rt.set_defaults(fn=cmd_restart)
 
     tg = sub.add_parser("toggle", help="enable/disable a provider")
     tg.add_argument("name")

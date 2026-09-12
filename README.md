@@ -99,8 +99,9 @@ gateway picks them up on the next request — no restart needed.
     K  edit keys             A  probe availability for all models
     r  re-detect             R  revive dead/benched keys
     t  enable/disable        l  open a live log terminal (new window)
-    T  toggle all models     ?  full keymap overlay
+    T  toggle all models     S  restart server (re-exec in place)
     u  usage for the selection (time windows or Hermes sessions)
+    ?  full keymap overlay
     j/k  move      ENTER  inspect the highlighted model
     c  set/clear its context window      tab  switch pane
     q  quit
@@ -228,6 +229,7 @@ first.
     GET  /healthz               providers, key health, rotation
     GET  /v1/logs?n=20          recent per-request log (model, key, status, ms, pin/pout/cached)
     POST /v1/revive             clear dead/cooldown key state
+    POST /v1/restart            re-exec in place (fresh config, clean keys)
 
 ## Tests
 

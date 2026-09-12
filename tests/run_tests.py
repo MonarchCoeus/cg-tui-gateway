@@ -1530,6 +1530,19 @@ class TestServer(ServerCase):
         self.assertFalse(ring.state[0].dead)
         self.assertEqual(ring.try_order(), [0, 1])
 
+    def test_restart_endpoint_responds_then_reexecs(self):
+        base = self.boot([])
+        fired = threading.Event()
+        real = SV._reexec
+        SV._reexec = fired.set
+        try:
+            r = H.post(base + "/v1/restart", {})
+            self.assertTrue(r.ok, r.text())
+            self.assertTrue((r.json() or {}).get("ok"))
+            self.assertTrue(fired.wait(5), "server must re-exec after /v1/restart")
+        finally:
+            SV._reexec = real
+
     def test_concurrent_requests_during_reload(self):
         """Readers must never see a half-swapped config."""
         p = C.new_provider("bare", UPBASE + "/bare/v1", ["a"], flavor="openai")
