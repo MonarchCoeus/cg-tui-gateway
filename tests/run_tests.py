@@ -24,7 +24,6 @@ from cgw import http as H  # noqa: E402
 from cgw import keyring as K  # noqa: E402
 from cgw import server as SV  # noqa: E402
 from cgw import translate as T  # noqa: E402
-from cgw import tui as TU  # noqa: E402
 from cgw import usage as U  # noqa: E402
 from cgw.server import serve  # noqa: E402
 
@@ -1651,7 +1650,9 @@ class TestServer(ServerCase):
         finally:
             SV._reexec = real
 
+    @unittest.skipIf(os.name == "nt", "curses unavailable (Windows)")
     def test_wait_for_restart(self):
+        from cgw import tui as TU  # noqa: E402 — local import: _curses missing on Windows
         base = self.boot([])
         started = H.get(base + "/healthz").json()["started"]
         t = TU.Tui(self.state.path)
