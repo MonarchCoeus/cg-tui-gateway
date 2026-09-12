@@ -1210,6 +1210,18 @@ class TestBackup(unittest.TestCase):
             self.assertEqual(oct(os.stat(dest).st_mode)[-3:], "600")
             self.assertEqual(C.load(dest)["providers"], C.load(path)["providers"])
 
+    def test_backup_missing_file_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "config.json")
+            with self.assertRaises(C.ConfigError):
+                C.backup_config(path)
+
+    def test_backup_dest_dir_created(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._cfg(d)
+            dest = C.backup_config(path, os.path.join(d, "sub", "dir", "copy.json"))
+            self.assertTrue(os.path.isfile(dest))
+
     def test_backup_refuses_corrupt(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "config.json")
@@ -1267,6 +1279,24 @@ class TestBackup(unittest.TestCase):
             with self.assertRaises(C.ConfigError):
                 C.restore_config(path, bad)
             self.assertEqual(C.load(path)["providers"][0]["name"], "p1")
+
+    def test_apply_listing_refuses_empty(self):
+        p = C.new_provider("p", "http://x/v1", ["k1"])
+        p["models"] = {"m1": {}, "m2": {"reasoning": True}}
+        res = {"flavor": "openai", "base_url": "http://other/v1",
+               "models": {}, "note": "manual flavor, model list unavailable"}
+        self.assertFalse(C.apply_listing(p, res))
+        self.assertEqual(p["base_url"], "http://x/v1")
+        self.assertEqual(sorted(p["models"]), ["m1", "m2"])
+
+    def test_apply_listing_merges_and_keeps_earned(self):
+        p = C.new_provider("p", "http://x/v1", ["k1"])
+        p["models"] = {"gone": {}, "kept": {"reasoning": True}}
+        res = {"flavor": "openai", "base_url": "http://x/v1",
+               "models": {"kept": {}, "new": {}}, "note": "listed 2 models"}
+        self.assertTrue(C.apply_listing(p, res))
+        self.assertEqual(sorted(p["models"]), ["kept", "new"])
+        self.assertTrue(p["models"]["kept"]["reasoning"])
 
 
 class ServerCase(unittest.TestCase):

@@ -617,10 +617,8 @@ class Tui:
         res = D.discover(p["base_url"], keys[0],
                          flavor=None if p.get("flavor") == "unknown" else p.get("flavor"))
         self.busy = None
-        p["flavor"] = res["flavor"]
-        p["base_url"] = res["base_url"]
-        p["models"] = C.merge_models(p.get("models"), res["models"])
-        self.save()
+        if C.apply_listing(p, res):
+            self.save()
         if res["flavor"] == "unknown":
             # a failure explanation is worth a modal; it scrolls off the status line
             self.show_error(scr, "detection failed: %s" % p["name"], res["note"])
@@ -1462,6 +1460,8 @@ class Tui:
         if not known:
             self.msg = "no backups yet (press b first)"
             return
+        # the picker has no scroll; cap it before it outgrows the screen
+        known = known[:30]
         picked = self.pick_window(scr, [(os.path.basename(b), b) for b in known],
                                   title=" restore backup ", sel=0)
         if not picked:

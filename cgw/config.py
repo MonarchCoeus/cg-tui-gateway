@@ -298,6 +298,21 @@ def merge_models(old, new):
     return out
 
 
+def apply_listing(p, res):
+    """Merge a fresh listing into a provider. Returns True if applied.
+
+    An empty listing means the request failed, not that the provider has
+    no models — applying it would merge against {} and drop every model
+    without earned facts. Refused, provider untouched.
+    """
+    if not res.get("models"):
+        return False
+    p["flavor"] = res["flavor"]
+    p["base_url"] = res["base_url"]
+    p["models"] = merge_models(p.get("models"), res["models"])
+    return True
+
+
 BACKUP_PREFIX = "config-"
 PRE_RESTORE_PREFIX = "config-pre-restore-"
 BACKUP_SUFFIX = ".json"
@@ -327,11 +342,15 @@ def backup_config(path=None, dest=None):
     helps nobody, and load() raising tells the caller why.
     """
     path = path or CONFIG_PATH
+    if not os.path.exists(path):
+        raise ConfigError("no config file at %s" % path)
     load(path)
     d = backup_dir(path)
     os.makedirs(d, mode=0o700, exist_ok=True)
     if dest is None:
         dest = os.path.join(d, "%s%s%s" % (BACKUP_PREFIX, time.strftime("%Y%m%d-%H%M%S"), BACKUP_SUFFIX))
+    parent = os.path.dirname(os.path.abspath(dest))
+    os.makedirs(parent, mode=0o700, exist_ok=True)
     dest = _unique(dest)
     shutil.copyfile(path, dest)
     os.chmod(dest, 0o600)

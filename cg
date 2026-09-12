@@ -127,9 +127,8 @@ def cmd_detect(args):
         return 1
     res = D.discover(p["base_url"], keys[0],
                      flavor=None if p["flavor"] == "unknown" else p["flavor"])
-    p["flavor"], p["base_url"] = res["flavor"], res["base_url"]
-    p["models"] = C.merge_models(p.get("models"), res["models"])
-    C.save(cfg, args.config)
+    if C.apply_listing(p, res):
+        C.save(cfg, args.config)
     print("%s: %s (%s), %d models" % (p["name"], res["note"], res["flavor"], len(p["models"])))
     return 0
 

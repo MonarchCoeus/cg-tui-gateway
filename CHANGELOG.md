@@ -8,6 +8,7 @@ All notable changes to CG — AI TUI Gateway. Format follows [Keep a Changelog](
 
 - Server restart from inside the app: `POST /v1/restart` re-execs the gateway in place (fresh config, clean key state, new code live); TUI `S` key (with confirm) and `cg restart` call it
 - Config backup/restore: TUI `b` saves a timestamped copy of providers + keys, `B` restores one from a picker (current config saved as a pre-restore copy first); `cg backup` / `cg restore [FILE|--latest]` do the same on the CLI
+- Failed re-detect no longer wipes the model list: an empty listing means the request failed, so the provider keeps its models, flavor, and URL (`r` in the TUI and `cg detect`)
 
 ## [1.1.2] — 2026-09-06
 
