@@ -21,7 +21,7 @@ import argparse
 import os
 import sys
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 
 # realpath, not abspath: this script is normally reached through a symlink
 # (~/.local/bin/GC), and abspath would leave us in the symlink's directory

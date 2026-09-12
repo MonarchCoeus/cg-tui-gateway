@@ -2,7 +2,7 @@
 
 All notable changes to CG — AI TUI Gateway. Format follows [Keep a Changelog](https://keepachangelog.com/), versions follow [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.1.3] — 2026-09-12
 
 ### Added
 
