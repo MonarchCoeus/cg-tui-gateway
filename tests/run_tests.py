@@ -1206,7 +1206,8 @@ class TestBackup(unittest.TestCase):
             path = self._cfg(d)
             dest = C.backup_config(path)
             self.assertTrue(os.path.isfile(dest))
-            self.assertEqual(oct(os.stat(dest).st_mode)[-3:], "600")
+            if os.name != "nt":  # POSIX modes are a no-op on Windows
+                self.assertEqual(oct(os.stat(dest).st_mode)[-3:], "600")
             self.assertEqual(C.load(dest)["providers"], C.load(path)["providers"])
 
     def test_backup_missing_file_errors(self):
