@@ -1384,18 +1384,63 @@ class Tui:
 
         Fresh config, clean key state, new code live — and this TUI
         process is untouched, so quit/relaunch it separately if the
-        TUI code itself changed.
+        TUI code itself changed. Waits for the new process to answer
+        so the status line confirms the restart instead of hanging on
+        "restarting...".
         """
         if not self.confirm(scr, "restart gateway?"):
             return
         listen = self.cfg.get("listen") or {}
         base = "http://%s:%s" % (listen.get("host", "127.0.0.1"), listen.get("port", C.DEFAULT_PORT))
+        try:
+            before = (H.get(base + "/healthz", timeout=3).json() or {}).get("started")
+        except Exception:
+            before = None
         r = H.post(base + "/v1/restart", {}, timeout=5)
         if not r.ok:
             self.msg = "server not running (%s)" % (r.status or r.error)
             return
         self._health = (None, 0.0)
-        self.msg = "restarting gateway..."
+        self.busy = "restarting gateway..."
+        self.draw(scr)
+        ok = self._wait_for_restart(base, before)
+        self.busy = None
+        self._health = (None, 0.0)
+        self.msg = "gateway restarted" if ok else "restart timed out — is the server still up?"
+
+    @staticmethod
+    def _poll_health(base):
+        try:
+            r = H.get(base + "/healthz", timeout=2)
+        except Exception:
+            return None
+        if not r.ok:
+            return None
+        try:
+            return r.json() or {}
+        except Exception:
+            return None
+
+    def _wait_for_restart(self, base, before, down_timeout=5.0, up_timeout=10.0):
+        """True once a post-restart gateway answers /healthz.
+
+        Waits for the old process to go away (or show a new start
+        time), then for something to answer again.
+        """
+        end = time.time() + down_timeout
+        while time.time() < end:
+            cur = self._poll_health(base)
+            if cur is None:
+                break  # old process gone; now wait for its replacement
+            if before is not None and cur.get("started") != before:
+                return True  # already replaced
+            time.sleep(0.3)
+        end = time.time() + up_timeout
+        while time.time() < end:
+            if self._poll_health(base) is not None:
+                return True
+            time.sleep(0.3)
+        return False
 
     def refresh_all(self):
         """F5: re-read the config from disk, re-probe gateway liveness,

@@ -24,6 +24,7 @@ from cgw import http as H  # noqa: E402
 from cgw import keyring as K  # noqa: E402
 from cgw import server as SV  # noqa: E402
 from cgw import translate as T  # noqa: E402
+from cgw import tui as TU  # noqa: E402
 from cgw import usage as U  # noqa: E402
 from cgw.server import serve  # noqa: E402
 
@@ -1542,6 +1543,13 @@ class TestServer(ServerCase):
             self.assertTrue(fired.wait(5), "server must re-exec after /v1/restart")
         finally:
             SV._reexec = real
+
+    def test_wait_for_restart(self):
+        base = self.boot([])
+        started = H.get(base + "/healthz").json()["started"]
+        t = TU.Tui(self.state.path)
+        self.assertTrue(t._wait_for_restart(base, (started or 0) - 1))
+        self.assertFalse(t._wait_for_restart("http://127.0.0.1:1", started, 0.2, 0.3))
 
     def test_concurrent_requests_during_reload(self):
         """Readers must never see a half-swapped config."""
