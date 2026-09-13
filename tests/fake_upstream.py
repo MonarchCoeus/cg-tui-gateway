@@ -175,6 +175,21 @@ class Fake(BaseHTTPRequestHandler):
                 "usage": {"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22},
             })
 
+        if mode == "tooler":
+            # A chat upstream that actually calls the offered tool: exercises
+            # the responses-side function_call plumbing end to end.
+            tools = body.get("tools") or []
+            name = (tools[0].get("function") or tools[0]).get("name", "tool") if tools else "tool"
+            return self._json(200, {
+                "id": "chatcmpl-tool", "object": "chat.completion",
+                "created": int(time.time()), "model": body.get("model"),
+                "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": None,
+                    "tool_calls": [{"id": "call_tool_1", "type": "function",
+                                    "function": {"name": name, "arguments": "{\"q\": 1}"}}]}}],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 7, "total_tokens": 37},
+            })
+
         if mode == "flaky":
             if self._bearer() != "good":
                 return self._json(429, {"error": {"message": "rate limited"}}, {"Retry-After": "60"})

@@ -123,6 +123,10 @@ def _model_items(payload):
             items = [dict(v, id=v.get("id", k)) for k, v in items.items() if isinstance(v, dict)]
     else:
         return []
+    if not isinstance(items, list):
+        # {"data": "error text"} used to iterate the string and invent one
+        # model per character; {"models": 5} raised TypeError out of detect.
+        return []
     out = []
     for it in items:
         if isinstance(it, str):

@@ -593,7 +593,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(text)
 
     def _emit_response(self, obj, usage, want_stream, model_id, label, started):
-        """Answer a response object as JSON or buffered SSE; log the hit."""
+        """Answer a response object as JSON or buffered SSE; log the hit.
+
+        Streaming emits the real Responses event sequence — created,
+        output_item.added, output_text/function_call_arguments deltas,
+        output_item.done, completed, [DONE] — not just a lone delta plus a
+        completed frame. Strict clients (Hermes' codex transport among them)
+        build their turn from output_item.done, so a function_call that only
+        ever appeared inside completed was dropped, and the client raised
+        "Responses API returned no output items".
+        """
         entry = {"t": started, "model": model_id, "key": label, "status": 200}
         if usage:
             entry.update(usage)
@@ -607,26 +616,14 @@ class Handler(BaseHTTPRequestHandler):
             entry["ms"] = int((time.time() - started) * 1000)
             self.state.record(entry)
             return
-        text = ""
-        msg_id = ""
-        for item in obj.get("output") or []:
-            if isinstance(item, dict) and item.get("type") == "message":
-                msg_id = item.get("id") or msg_id
-                for part in item.get("content") or []:
-                    if isinstance(part, dict) and part.get("type") == "output_text":
-                        text += part.get("text") or ""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
-        if text:
-            self.wfile.write(b"data: " + json.dumps(
-                {"type": "response.output_text.delta", "item_id": msg_id,
-                 "output_index": 0, "content_index": 0, "delta": text}).encode() + b"\n\n")
-        self.wfile.write(b"data: " + json.dumps(
-            {"type": "response.completed", "response": obj}).encode() + b"\n\n")
+        for frame in T.responses_sse_frames(obj):
+            self.wfile.write(b"data: " + json.dumps(frame).encode() + b"\n\n")
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
         entry["ms"] = int((time.time() - started) * 1000)

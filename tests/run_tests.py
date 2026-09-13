@@ -364,6 +364,18 @@ class TestDetect(unittest.TestCase):
         self.assertEqual([m["id"] for m in D._model_items({"data": [{"id": "x"}]})], ["x"])
         self.assertEqual([m["id"] for m in D._model_items({"models": {"y": {"context": 1}}})], ["y"])
 
+    def test_model_items_rejects_non_lists(self):
+        """A JSON scalar in the listing must not explode or invent models.
+
+        {"data": "error text"} used to be iterated as a string, producing one
+        fake model per character; {"models": 5} raised TypeError out of
+        detect, killing the whole re-list.
+        """
+        self.assertEqual(D._model_items({"data": "error text"}), [])
+        self.assertEqual(D._model_items({"models": 5}), [])
+        self.assertEqual(D._model_items({"data": 0}), [])
+        self.assertEqual(D._model_items({"result": True}), [])
+
 
 class TestReasoningEvidence(unittest.TestCase):
     """A 'yes' must rest on an actual trace, never on a key being present."""
@@ -1139,6 +1151,8 @@ class TestTranslate(unittest.TestCase):
                 {"type": "message", "role": "user", "content": [
                     {"type": "input_text", "text": "what is this"},
                     {"type": "input_image", "image_url": "data:image/png;base64,AAA"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "get_time",
+                 "arguments": "{}"},
                 {"type": "function_call_output", "call_id": "call_1",
                  "output": "{\"t\": 1}"}],
             "tools": [{"type": "function", "name": "get_time",
@@ -1149,13 +1163,65 @@ class TestTranslate(unittest.TestCase):
         self.assertIn({"type": "text", "text": "what is this"}, user["content"])
         self.assertIn({"type": "image_url",
                        "image_url": {"url": "data:image/png;base64,AAA"}}, user["content"])
-        self.assertEqual(got["messages"][1]["role"], "tool")
-        self.assertEqual(got["messages"][1]["tool_call_id"], "call_1")
+        self.assertEqual(got["messages"][1]["role"], "assistant")
+        self.assertEqual(got["messages"][1]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(got["messages"][2]["role"], "tool")
+        self.assertEqual(got["messages"][2]["tool_call_id"], "call_1")
         self.assertEqual(got["tools"], [{"type": "function",
                                          "function": {"name": "get_time",
                                                       "parameters": {"type": "object"}}}])
         self.assertEqual(got["tool_choice"], {"type": "function",
                                               "function": {"name": "get_time"}})
+
+    def test_responses_in_to_chat_pairs_tool_calls_with_results(self):
+        """A call and its result must pair up as assistant.tool_calls + tool.
+
+        The old shape flattened a function_call item into assistant prose
+        ("called get_time({...})") and then emitted an orphaned role:tool
+        message — strict chat upstreams reject the unpairable tool turn, and
+        multi-turn agent loops lost every argument they had sent.
+        """
+        got = T.responses_in_to_chat({
+            "model": "m",
+            "input": [
+                {"role": "user", "content": "what time is it"},
+                {"type": "function_call", "call_id": "call_9", "name": "get_time",
+                 "arguments": "{\"tz\": \"UTC\"}"},
+                {"type": "function_call_output", "call_id": "call_9", "output": "12:00"},
+            ]})
+        msgs = got["messages"]
+        self.assertEqual(msgs[0]["role"], "user")
+        assistant = msgs[1]
+        self.assertEqual(assistant["role"], "assistant")
+        self.assertEqual(assistant["tool_calls"],
+                         [{"id": "call_9", "type": "function",
+                           "function": {"name": "get_time", "arguments": "{\"tz\": \"UTC\"}"}}])
+        self.assertEqual(msgs[2]["role"], "tool")
+        self.assertEqual(msgs[2]["tool_call_id"], "call_9")
+        self.assertEqual(msgs[2]["content"], "12:00")
+        # the transcript may not end on a non-user turn
+        self.assertEqual(msgs[-1]["content"], "Continue.")
+        self.assertEqual(msgs[-1]["role"], "user")
+
+    def test_responses_in_to_chat_orphan_tool_result_stays_visible(self):
+        """A tool result with no matching call must not become an unroutable turn."""
+        got = T.responses_in_to_chat({
+            "model": "m",
+            "input": [{"role": "user", "content": "hi"},
+                      {"type": "function_call_output", "call_id": "ghost", "output": "42"}]})
+        roles = [m["role"] for m in got["messages"]]
+        self.assertNotIn("tool", roles)
+        self.assertIn("42", got["messages"][1]["content"])
+
+    def test_responses_in_to_chat_arguments_dict_is_serialized(self):
+        """Arguments arriving as an object (not a string) must serialize."""
+        got = T.responses_in_to_chat({
+            "model": "m",
+            "input": [{"role": "user", "content": "go"},
+                      {"type": "function_call", "id": "fc_1", "name": "t",
+                       "arguments": {"a": 1}}]})
+        call = got["messages"][-2]["tool_calls"][0]
+        self.assertEqual(call["function"]["arguments"], "{\"a\": 1}")
 
     def test_chat_completion_to_responses_folds_text_and_calls(self):
         completion = {"id": "chatcmpl-1", "model": "m",
@@ -1412,9 +1478,66 @@ class TestServer(ServerCase):
         r = H.post(base + "/v1/responses",
                    {"model": "bare/bare-a", "input": "ping", "stream": True})
         self.assertTrue(r.ok, r.text())
-        self.assertIn("response.output_text.delta", r.text())
-        self.assertIn("response.completed", r.text())
-        self.assertIn("[DONE]", r.text())
+        body = r.text(limit=200000)
+        self.assertIn("response.output_text.delta", body)
+        self.assertIn("response.completed", body)
+        self.assertIn("[DONE]", body)
+
+    def test_responses_in_stream_emits_item_events(self):
+        """The whole item lifecycle must be on the wire, in order.
+
+        Strict Responses clients (Hermes' codex transport) assemble the turn
+        from output_item.done, not from the completed frame: a stream that
+        only carried output_text.delta + response.completed made every turn
+        end in "Responses API returned no output items".
+        """
+        p = C.new_provider("bare", UPBASE + "/bare/v1", ["k"], flavor="openai")
+        p["models"] = {"bare-a": {}}
+        base = self.boot([p])
+        r = H.post(base + "/v1/responses",
+                   {"model": "bare/bare-a", "input": "ping", "stream": True})
+        self.assertTrue(r.ok, r.text())
+        body = r.text(limit=200000)
+        types = [json.loads(line[5:].strip()).get("type")
+                 for line in body.splitlines()
+                 if line.startswith("data:") and line[5:].strip() != "[DONE]"]
+        for expected in ("response.created", "response.in_progress",
+                         "response.output_item.added", "response.output_text.delta",
+                         "response.output_text.done", "response.output_item.done",
+                         "response.completed"):
+            self.assertIn(expected, types)
+        self.assertLess(types.index("response.output_item.added"),
+                        types.index("response.output_text.delta"))
+        self.assertLess(types.index("response.output_item.done"),
+                        types.index("response.completed"))
+        seqs = [json.loads(line[5:].strip()).get("sequence_number")
+                for line in body.splitlines()
+                if line.startswith("data:") and line[5:].strip() != "[DONE]"]
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertTrue(all(isinstance(s, int) for s in seqs))
+
+    def test_responses_in_stream_emits_tool_call_events(self):
+        """A tool call must be announced and confirmed as a function_call item."""
+        p = C.new_provider("tool", UPBASE + "/tooler/v1", ["k"], flavor="openai")
+        p["models"] = {"bare-a": {}}
+        base = self.boot([p])
+        r = H.post(base + "/v1/responses",
+                   {"model": "tool/bare-a", "input": "what time is it", "stream": True,
+                    "tools": [{"type": "function", "name": "get_time",
+                               "parameters": {"type": "object"}}]})
+        self.assertTrue(r.ok, r.text())
+        frames = [json.loads(line[5:].strip())
+                  for line in r.text(limit=200000).splitlines()
+                  if line.startswith("data:") and line[5:].strip() != "[DONE]"]
+        done = [f for f in frames if f.get("type") == "response.output_item.done"
+                and (f.get("item") or {}).get("type") == "function_call"]
+        self.assertTrue(done, "function_call item never confirmed: %s"
+                        % [f.get("type") for f in frames])
+        call = done[0]["item"]
+        self.assertEqual(call["name"], "get_time")
+        self.assertEqual(call["arguments"], "{\"q\": 1}")
+        self.assertIn("response.function_call_arguments.done",
+                      [f.get("type") for f in frames])
 
     def test_responses_in_passes_through_responses_upstream(self):
         p = C.new_provider("resp", UPBASE + "/respondent/v1", ["k"], flavor="openai")

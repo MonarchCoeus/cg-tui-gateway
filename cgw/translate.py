@@ -540,6 +540,7 @@ def responses_in_to_chat(body):
     are dropped — fulfillment is always a fresh chat call.
     """
     msgs = []
+    known_calls = set()
     instr = body.get("instructions")
     if isinstance(instr, str) and instr.strip():
         msgs.append({"role": "system", "content": instr})
@@ -588,20 +589,39 @@ def responses_in_to_chat(body):
                 msgs.append({"role": role, "content": text})
         elif t == "function_call_output":
             out = it.get("output")
-            msgs.append({"role": "tool",
-                         "content": out if isinstance(out, str) else json.dumps(out or ""),
-                         "tool_call_id": it.get("call_id") or it.get("id") or ""})
+            text = out if isinstance(out, str) else json.dumps(out if out is not None else "")
+            cid = it.get("call_id") or it.get("id") or ""
+            # A tool message whose call_id matches no assistant tool_call is
+            # rejected by chat upstreams; keep the content visible instead of
+            # sending an unpairable tool turn.
+            if cid in known_calls:
+                msgs.append({"role": "tool", "content": text, "tool_call_id": cid})
+            else:
+                msgs.append({"role": "user", "content": "Tool result: " + text})
         elif t == "function_call" and it.get("name"):
-            msgs.append({"role": "assistant",
-                         "content": "called %s(%s)" % (it["name"], it.get("arguments") or "")})
+            cid = it.get("call_id") or it.get("id") or "call_%d" % len(msgs)
+            args = it.get("arguments")
+            args = args if isinstance(args, str) else json.dumps(args or {})
+            call = {"id": cid, "type": "function",
+                    "function": {"name": it["name"], "arguments": args}}
+            known_calls.add(cid)
+            # OpenAI shape: the call belongs to the assistant turn that made
+            # it, and the matching tool result references its id. Repainting
+            # it as assistant prose ("called foo(...)") made upstreams see an
+            # assistant text turn followed by an orphaned tool message.
+            if msgs and msgs[-1].get("role") == "assistant":
+                msgs[-1].setdefault("tool_calls", []).append(call)
+                msgs[-1].setdefault("content", None)
+            else:
+                msgs.append({"role": "assistant", "content": None, "tool_calls": [call]})
         # reasoning / other item types carry no chat-visible content: skip
     if not msgs:
         msgs = [{"role": "user", "content": "hi"}]
-    # A Responses transcript can legitimately end on an assistant item (a
-    # client resuming a turn). Chat-only upstreams hard-reject that with
-    # 400 "last message must have role=user", so nudge instead of failing
-    # the whole request.
-    elif msgs[-1]["role"] == "assistant":
+    # A Responses transcript can legitimately end on an assistant item or on
+    # tool results (a client resuming a turn). Chat-only upstreams hard-reject
+    # that with 400 "last message must have role=user", so nudge instead of
+    # failing the whole request.
+    elif msgs[-1]["role"] != "user":
         msgs.append({"role": "user", "content": "Continue."})
     out = {"model": body.get("model"), "messages": msgs}
     want = body.get("max_output_tokens")
@@ -635,6 +655,81 @@ def responses_in_to_chat(body):
     return out
 
 
+def responses_sse_frames(obj):
+    """Expand a Responses object into the SSE event sequence clients expect.
+
+    The Responses protocol is item-oriented: every output item is announced
+    (``response.output_item.added``), streamed (``response.output_text.delta``
+    for messages, ``response.function_call_arguments.delta`` for tool calls),
+    confirmed (``*.done``) and closed with ``response.completed`` carrying the
+    final object. Clients that assemble the turn from item events — Hermes'
+    codex transport does exactly this — see nothing otherwise and abort the
+    turn with "Responses API returned no output items".
+
+    Buffering upstream means every frame here is emitted after the fact; the
+    sequence still has to be complete and in order for those clients.
+    """
+    frames = []
+    out = obj.get("output") if isinstance(obj, dict) else None
+    out = out if isinstance(out, list) else []
+    seq = 0
+
+    def emit(payload):
+        nonlocal seq
+        payload["sequence_number"] = seq
+        seq += 1
+        frames.append(payload)
+
+    emit({"type": "response.created", "response": obj})
+    emit({"type": "response.in_progress", "response": obj})
+    for index, item in enumerate(out):
+        if not isinstance(item, dict):
+            continue
+        emit({"type": "response.output_item.added", "output_index": index, "item": item})
+        itype = item.get("type")
+        if itype == "message":
+            part_index = 0
+            for part in item.get("content") or []:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "output_text":
+                    text = part.get("text") or ""
+                    emit({"type": "response.content_part.added", "item_id": item.get("id"),
+                          "output_index": index, "content_index": part_index, "part": part})
+                    if text:
+                        emit({"type": "response.output_text.delta", "item_id": item.get("id"),
+                              "output_index": index, "content_index": part_index,
+                              "delta": text, "logprobs": []})
+                    emit({"type": "response.output_text.done", "item_id": item.get("id"),
+                          "output_index": index, "content_index": part_index, "text": text})
+                    emit({"type": "response.content_part.done", "item_id": item.get("id"),
+                          "output_index": index, "content_index": part_index, "part": part})
+                    part_index += 1
+        elif itype in ("function_call", "custom_tool_call"):
+            args = item.get("arguments")
+            args = args if isinstance(args, str) else json.dumps(args or {})
+            if args:
+                emit({"type": "response.function_call_arguments.delta",
+                      "item_id": item.get("id"), "output_index": index, "delta": args})
+            emit({"type": "response.function_call_arguments.done", "item_id": item.get("id"),
+                  "output_index": index, "arguments": args})
+        elif itype == "reasoning":
+            for summary_index, part in enumerate(item.get("summary") or []):
+                if isinstance(part, dict) and part.get("text"):
+                    emit({"type": "response.reasoning_summary_part.added",
+                          "item_id": item.get("id"), "output_index": index,
+                          "summary_index": summary_index, "part": part})
+                    emit({"type": "response.reasoning_summary_text.delta",
+                          "item_id": item.get("id"), "output_index": index,
+                          "summary_index": summary_index, "delta": part["text"]})
+                    emit({"type": "response.reasoning_summary_text.done",
+                          "item_id": item.get("id"), "output_index": index,
+                          "summary_index": summary_index, "text": part["text"]})
+        emit({"type": "response.output_item.done", "output_index": index, "item": item})
+    emit({"type": "response.completed", "response": obj})
+    return frames
+
+
 def chat_completion_to_responses(completion, model):
     """Fold a chat.completion into a Responses-API response object.
 
@@ -661,7 +756,7 @@ def chat_completion_to_responses(completion, model):
         args = fn.get("arguments")
         cid = (tc.get("id") if isinstance(tc, dict) else None) or "call_%d" % len(output)
         output.append({"type": "function_call", "id": cid, "call_id": cid,
-                       "name": fn["name"],
+                       "name": fn["name"], "status": "completed",
                        "arguments": args if isinstance(args, str) else json.dumps(args or {})})
     finish = choice.get("finish_reason") or "stop"
     usage = (completion or {}).get("usage") or {}

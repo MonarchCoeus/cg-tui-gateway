@@ -2,6 +2,51 @@
 
 All notable changes to CG — AI TUI Gateway. Format follows [Keep a Changelog](https://keepachangelog.com/), versions follow [SemVer](https://semver.org/).
 
+## [1.1.4] — 2026-09-13
+
+### Fixed
+
+- **Responses streaming was unusable by strict clients.** `POST /v1/responses`
+  with `stream: true` emitted only one text delta plus `response.completed`.
+  Clients that assemble a turn from the item events — Hermes' codex transport
+  is one — saw no `output_item.done`, no `function_call` item, and aborted
+  every turn with "Responses API returned no output items" (or silently
+  stalled after the first reply). The stream now carries the real event
+  sequence: `response.created`, `response.in_progress`,
+  `output_item.added`, `content_part.added/done`, `output_text.delta/done`,
+  `function_call_arguments.delta/done`, reasoning summary deltas,
+  `output_item.done`, `response.completed`, `[DONE]`, with monotonic
+  `sequence_number` on every frame
+- Tool calls over `/v1/responses` are now confirmed as `function_call` items
+  with `status: completed` — without it the adapter's scan treated the item as
+  incomplete and dropped the call
+- Tool traffic in an inbound Responses transcript is paired as OpenAI expects:
+  `function_call` items become an assistant `tool_calls` turn and
+  `function_call_output` becomes the matching `role: tool` message. Previously
+  the call was flattened to assistant prose ("called foo(...)") and the result
+  was sent as an orphaned tool turn, which strict chat upstreams reject; a
+  result with no matching call now stays visible as text instead of becoming
+  unroutable
+- A transcript ending on a tool result no longer 400s the chat upstream
+  ("last message must have role=user")
+- `function_call` arguments arriving as an object (not a JSON string) are
+  serialized instead of being passed through as a dict
+- TUI: a narrow terminal (46x12, 30x8) crashed the whole UI with
+  `_curses.error: addnwstr() returned ERR` — the middle pane's column headers
+  were written past the right edge. Every curses write now goes through
+  clamping helpers that clip to the window and never raise
+- `detect`: a provider listing whose model container is not a list
+  (`{"data": "error text"}`, `{"models": 5}`) no longer invents one model per
+  character or raises `TypeError` out of `detect`
+
+### Added
+
+- `tests/tui_smoke.py` now drives every advertised binding in a pty across
+  four terminal sizes, and `tests/fake_upstream.py` gained a `tooler` mode
+  that answers with a real tool call
+- Regression tests for the full SSE event sequence, tool-call item events,
+  tool pairing, argument serialization, and non-list listings
+
 ## [1.1.3] — 2026-09-12
 
 ### Added

@@ -234,8 +234,8 @@ first.
 
 ## Tests
 
-    python3 tests/run_tests.py    145 tests against a local fake upstream
-    python3 tests/tui_smoke.py    renders the TUI in a pty and checks output
+    python3 tests/run_tests.py    220 tests against a local fake upstream
+    python3 tests/tui_smoke.py    drives the TUI in a pty: every binding, four terminal sizes
 
 No network access, no real API calls, no credits spent. The fake upstream in
 `tests/fake_upstream.py` simulates providers that volunteer capability flags,

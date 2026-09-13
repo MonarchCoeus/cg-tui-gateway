@@ -51,20 +51,20 @@ def round_box(win, title=""):
     """Rounded-corner modal frame (╭─╮ / ╰─╯) with an inset title."""
     h, w = win.getmaxyx()
     try:
-        win.addch(0, 0, "╭")
-        win.addch(0, w - 1, "╮")
-        win.addch(h - 1, 0, "╰")
-        win.addch(h - 1, w - 1, "╯")
+        Tui._putch(win, 0, 0, "╭")
+        Tui._putch(win, 0, w - 1, "╮")
+        Tui._putch(win, h - 1, 0, "╰")
+        Tui._putch(win, h - 1, w - 1, "╯")
         for i in range(1, w - 1):
-            win.addch(0, i, "─")
-            win.addch(h - 1, i, "─")
+            Tui._putch(win, 0, i, "─")
+            Tui._putch(win, h - 1, i, "─")
         for i in range(1, h - 1):
-            win.addch(i, 0, "│")
-            win.addch(i, w - 1, "│")
+            Tui._putch(win, i, 0, "│")
+            Tui._putch(win, i, w - 1, "│")
     except curses.error:
         win.box()
     if title:
-        win.addnstr(0, 2, " %s " % title[:w - 6], w - 4, curses.A_BOLD)
+        Tui._put(win, 0, 2, " %s " % title[:w - 6], w - 4, curses.A_BOLD)
 
 
 def _cap(val):
@@ -265,6 +265,59 @@ class Tui:
     # the terminal is too narrow to hold both.
     MIN_INPUT_COLS = 10
 
+    # ---------- safe drawing ----------
+    #
+    # addnstr/addch raise _curses.error when asked to write outside the
+    # window (or onto its final cell). A narrow terminal put the middle
+    # pane's column headers past the right edge and the whole TUI died with
+    # a traceback instead of drawing what fits. Every write goes through
+    # these two: clamp, clip, swallow.
+
+    @staticmethod
+    def _put(win, y, x, text, n=None, attr=0):
+        """addnstr that never raises. n defaults to the text length."""
+        if win is None:
+            return
+        text = "" if text is None else str(text)
+        try:
+            h, w = win.getmaxyx()
+        except Exception:
+            return
+        if y < 0 or y >= h or x >= w - 1:
+            return
+        room = (w - 1) - x
+        if room <= 0:
+            return
+        if n is None:
+            n = len(text)
+        n = min(n, room, len(text))
+        if n <= 0:
+            return
+        try:
+            win.addnstr(y, x, text[:n], n, attr)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _putch(win, y, x, ch, attr=0):
+        """addch that never raises."""
+        if win is None:
+            return
+        try:
+            h, w = win.getmaxyx()
+        except Exception:
+            return
+        if y < 0 or y >= h or x < 0 or x >= w - 1:
+            return
+        try:
+            win.addch(y, x, ch, attr)
+        except Exception:
+            pass
+
+    def _line(self, win, y, x, text, attr=0):
+        """Draw one full-width-ish line, clipped to the pane."""
+        self._put(win, y, x, text, len(str(text)), attr)
+
     def prompt(self, scr, label, secret=False, on_change=None):
         """Read a line at the bottom of the screen. Never truncates the value.
 
@@ -300,9 +353,9 @@ class Tui:
                 scr.move(h - 1, 0)
                 scr.clrtoeol()
                 if lab:
-                    scr.addnstr(h - 1, 0, lab, min(len(lab), w - 1), curses.A_BOLD)
+                    self._put(scr, h - 1, 0, lab, min(len(lab), w - 1), curses.A_BOLD)
                 if tail:
-                    scr.addnstr(h - 1, len(lab), tail, min(len(tail), w - len(lab) - 1))
+                    self._put(scr, h - 1, len(lab), tail, min(len(tail), w - len(lab) - 1))
                 scr.move(h - 1, min(len(lab) + len(tail), w - 1))
                 scr.refresh()
             except curses.error:
@@ -388,12 +441,12 @@ class Tui:
             right += "  http://%s:%s/v1" % (host, port)
 
         # title bar: name left, live gateway state right
-        scr.addnstr(0, 0, " CG — Coeus Gateway", min(w - 1, 20), curses.A_BOLD)
+        self._put(scr, 0, 0, " CG — Coeus Gateway", min(w - 1, 20), curses.A_BOLD)
         if right:
-            scr.addnstr(0, max(0, w - len(right) - 1), right, len(right), r_attr)
+            self._put(scr, 0, max(0, w - len(right) - 1), right, len(right), r_attr)
         try:
             for i in range(w - 1):
-                scr.addch(1, i, "─", curses.A_DIM)
+                self._putch(scr, 1, i, "─", curses.A_DIM)
         except curses.error:
             pass
 
@@ -408,7 +461,7 @@ class Tui:
         insp_w = w - insp_x - 1 if right_w else 0
 
         # left pane: providers
-        scr.addnstr(2, 0, " providers", left_w - 1,
+        self._put(scr, 2, 0, " providers", left_w - 1,
                     curses.A_BOLD if self.focus == "left" else cl["dim"])
         for i, p in enumerate(self.provs()):
             if 3 + i >= h - 2:
@@ -421,21 +474,21 @@ class Tui:
                 mark, m_attr = "○", cl["dim"]
             cur = i == self.sel
             sel = cur and self.focus == "left"
-            scr.addnstr(3 + i, 0, "▸" if cur else " ", 1,
+            self._put(scr, 3 + i, 0, "▸" if cur else " ", 1,
                         cl["sel"] if sel else cl["dim"])
-            scr.addnstr(3 + i, 1, "%s " % mark, 2, m_attr)
+            self._put(scr, 3 + i, 1, "%s " % mark, 2, m_attr)
             name = p["name"][:max(4, left_w - 5)]
-            scr.addnstr(3 + i, 3, name, len(name),
+            self._put(scr, 3 + i, 3, name, len(name),
                         cl["sel"] if sel else cl["accent"])
 
         # divider between left and middle panes
         for y in range(2, h - 2):
-            scr.addch(y, mid_x - 1, "│", curses.A_DIM)
+            self._putch(scr, y, mid_x - 1, "│", curses.A_DIM)
 
         # middle pane: provider summary + model table
         p = self.cur()
         if p is None:
-            scr.addnstr(3, mid_x + 1, "no providers yet — press 'a' to add one",
+            self._put(scr, 3, mid_x + 1, "no providers yet — press 'a' to add one",
                         mid_w - 2, cl["dim"])
         else:
             nk = len(p.get("keys") or [])
@@ -443,7 +496,7 @@ class Tui:
                 p["name"], p.get("flavor", "unknown"),
                 p.get("rotation", "fill_first").replace("_", "-"), nk,
                 "" if insp_w else " · " + p.get("base_url", ""))
-            scr.addnstr(2, mid_x + 1, summ[: mid_w - 2], mid_w - 2, cl["accent"])
+            self._put(scr, 2, mid_x + 1, summ[: mid_w - 2], mid_w - 2, cl["accent"])
 
             models = self.models(p)
             total = len(p.get("models") or {})
@@ -457,13 +510,13 @@ class Tui:
             y = 3
             head_attr = ((curses.A_BOLD | curses.A_UNDERLINE)
                          if self.focus == "right" else curses.A_UNDERLINE)
-            scr.addnstr(y, mid_x + o_name, "model", 5, head_attr)
+            self._put(scr, y, mid_x + o_name, "model", 5, head_attr)
             for off, lab in ((o_rsn, "rsn"), (o_vis, "vis"), (o_av, "avail"), (o_ctx, "ctx")):
-                scr.addnstr(y, mid_x + off, lab, 5, head_attr)
+                self._put(scr, y, mid_x + off, lab, 5, head_attr)
             y += 1
             try:
                 for i in range(mid_w - 1):
-                    scr.addch(y, mid_x + i, "─", curses.A_DIM)
+                    self._putch(scr, y, mid_x + i, "─", curses.A_DIM)
             except curses.error:
                 pass
             y += 1
@@ -471,10 +524,10 @@ class Tui:
             body_h = max(1, h - 2 - y)
             if not models:
                 if self.filter:
-                    scr.addnstr(y, mid_x + 1, "no match for /%s (%d models)" % (self.filter, total),
+                    self._put(scr, y, mid_x + 1, "no match for /%s (%d models)" % (self.filter, total),
                                 mid_w - 2, cl["dim"])
                 else:
-                    scr.addnstr(y, mid_x + 1, "(none — press r to detect, or m to add by hand)",
+                    self._put(scr, y, mid_x + 1, "(none — press r to detect, or m to add by hand)",
                                 mid_w - 2, cl["dim"])
             else:
                 # keep the cursor inside the visible window
@@ -491,13 +544,13 @@ class Tui:
                     sel = cur and self.focus == "right"
                     on = meta.get("enabled", True)
                     name_s = ("%-*s" % (name_w, mid[:name_w]))[: mid_w - o_name - 1]
-                    scr.addnstr(yy, mid_x, "▸" if cur else " ", 1,
+                    self._put(scr, yy, mid_x, "▸" if cur else " ", 1,
                                 cl["sel"] if sel else cl["dim"])
-                    scr.addnstr(yy, mid_x + 1,
+                    self._put(scr, yy, mid_x + 1,
                                 "●" if on else "○", 1,
                                 cl["sel"] if sel else
                                 (cl["right"] if on else cl["dim"]))
-                    scr.addnstr(yy, mid_x + o_name, name_s, mid_w - o_name - 1,
+                    self._put(scr, yy, mid_x + o_name, name_s, mid_w - o_name - 1,
                                 cl["sel"] if sel else
                                 (curses.A_DIM if not on else curses.A_NORMAL))
                     # capability glyphs and ctx are drawn ON the selection bar:
@@ -506,11 +559,11 @@ class Tui:
                                      (o_vis, meta.get("vision")),
                                      (o_av, meta.get("available"))):
                         g, ga = _glyph(val, cl)
-                        scr.addnstr(yy, mid_x + off, g, 1,
+                        self._put(scr, yy, mid_x + off, g, 1,
                                     cl["sel"] if sel else
                                     (cl["dim"] if not on else ga))
                     ctx_s = "%-5s" % _ctx(meta.get("context"))
-                    scr.addnstr(yy, mid_x + o_ctx, ctx_s, 5,
+                    self._put(scr, yy, mid_x + o_ctx, ctx_s, 5,
                                 cl["sel"] if sel else
                                 (cl["dim"] if not on else curses.A_NORMAL))
 
@@ -519,16 +572,16 @@ class Tui:
                     foot += "  /%s" % self.filter
                 if len(models) < total:
                     foot += "  (of %d)" % total
-                scr.addnstr(h - 2, mid_x + max(0, mid_w - len(foot) - 1), foot, len(foot), cl["right"])
+                self._put(scr, h - 2, mid_x + max(0, mid_w - len(foot) - 1), foot, len(foot), cl["right"])
 
         # right pane: provider + selected-model inspection (layout B)
         if insp_w:
             for y in range(2, h - 2):
-                scr.addch(y, insp_x - 1, "│", curses.A_DIM)
-            scr.addnstr(2, insp_x + 1, " inspection", insp_w - 1, curses.A_BOLD)
+                self._putch(scr, y, insp_x - 1, "│", curses.A_DIM)
+            self._put(scr, 2, insp_x + 1, " inspection", insp_w - 1, curses.A_BOLD)
             y = 3
             if p is None:
-                scr.addnstr(y, insp_x + 1, "(no provider selected)", insp_w - 2, cl["accent"])
+                self._put(scr, y, insp_x + 1, "(no provider selected)", insp_w - 2, cl["accent"])
             else:
                 for k, v in (("url", p.get("base_url", "")),
                              ("flavor", p.get("flavor", "unknown")),
@@ -536,19 +589,19 @@ class Tui:
                              ("keys", "%d: %s" % (len(p.get("keys") or []),
                                                   ", ".join(k.get("label", "k")
                                                             for k in p.get("keys") or [])))):
-                    scr.addnstr(y, insp_x + 1, "%-7s" % k, 7, cl["right"])
-                    scr.addnstr(y, insp_x + 9, v[: insp_w - 10], max(0, insp_w - 10))
+                    self._put(scr, y, insp_x + 1, "%-7s" % k, 7, cl["right"])
+                    self._put(scr, y, insp_x + 9, v[: insp_w - 10], max(0, insp_w - 10))
                     y += 1
                     if y >= h - 3:
                         y = h - 3  # clamp: short windows must not write past the pane
                 y += 1
                 mid, meta = self.cur_model()
                 if not mid:
-                    scr.addnstr(y, insp_x + 1, "(no models yet)", insp_w - 2, cl["accent"])
+                    self._put(scr, y, insp_x + 1, "(no models yet)", insp_w - 2, cl["accent"])
                 else:
                     meta = dict(meta or {})
                     on = meta.get("enabled", True)
-                    scr.addnstr(y, insp_x + 1, " %s" % mid[: insp_w - 3],
+                    self._put(scr, y, insp_x + 1, " %s" % mid[: insp_w - 3],
                                 insp_w - 2, curses.A_BOLD)
                     y += 1
                     rows = []
@@ -571,8 +624,8 @@ class Tui:
                     for k, v, a in rows:
                         if y >= h - 3:
                             break
-                        scr.addnstr(y, insp_x + 1, "%-7s" % k, 7, cl["right"])
-                        scr.addnstr(y, insp_x + 9, v[: insp_w - 10], max(0, insp_w - 10), a)
+                        self._put(scr, y, insp_x + 1, "%-7s" % k, 7, cl["right"])
+                        self._put(scr, y, insp_x + 9, v[: insp_w - 10], max(0, insp_w - 10), a)
                         y += 1
                 y = min(y, h - 3)
                 y += 1
@@ -585,23 +638,23 @@ class Tui:
                          ("R", "revive"), ("S", "restart"), ("l", "logs"), ("tab", "switch"),
                          ("F5", "refresh"), ("?", "help"), ("q", "quit")]
                 if y < h - 2:
-                    scr.addnstr(y, insp_x + 1, "keys", insp_w - 2, curses.A_NORMAL)
+                    self._put(scr, y, insp_x + 1, "keys", insp_w - 2, curses.A_NORMAL)
                     y += 1
                 for key, desc in binds:
                     if y >= h - 2:
                         break
-                    scr.addnstr(y, insp_x + 1, "%s: %s" % (key, desc),
+                    self._put(scr, y, insp_x + 1, "%s: %s" % (key, desc),
                                 insp_w - 2, cl["accent"])
                     y += 1
 
         # status line: spinner while busy, last message otherwise
         if self.busy:
             spin = SPIN[int(time.time() * 10) % len(SPIN)]
-            scr.addnstr(h - 2, 0, ("%s %s" % (spin, self.busy))[:w - 1], w - 1, cl["warn"])
+            self._put(scr, h - 2, 0, ("%s %s" % (spin, self.busy))[:w - 1], w - 1, cl["warn"])
         elif self.msg:
-            scr.addnstr(h - 2, 0, self.msg[:w - 1], w - 1, curses.A_BOLD)
+            self._put(scr, h - 2, 0, self.msg[:w - 1], w - 1, curses.A_BOLD)
         # bindings are drawn in the right pane; keep the bottom row clean
-        scr.addnstr(h - 1, 0, " " * (w - 1), w - 1)
+        self._put(scr, h - 1, 0, " " * (w - 1), w - 1)
         scr.refresh()
 
     # ---------- actions ----------
@@ -637,8 +690,8 @@ class Tui:
         win = curses.newwin(bh, bw, top, left)
         round_box(win, title)
         for i, line in enumerate(lines):
-            win.addnstr(2 + i, 2, line, bw - 4)
-        win.addnstr(bh - 2, 2, hint, bw - 4, curses.A_DIM)
+            self._put(win, 2 + i, 2, line, bw - 4)
+        self._put(win, bh - 2, 2, hint, bw - 4, curses.A_DIM)
         win.refresh()
         win.getch()
 
@@ -861,12 +914,12 @@ class Tui:
             if k in ("reasoning", "vision", "available"):
                 cap, note = v.split(" — ", 1)
                 g, ga = _glyph({"yes": True, "no": False, "-": None}[cap], self.cl)
-                win.addnstr(1 + i, 2, "%-10s" % k, 10, curses.A_DIM)
-                win.addnstr(1 + i, 12, g, 1, ga)
-                win.addnstr(1 + i, 14, note, bw - 16)
+                self._put(win, 1 + i, 2, "%-10s" % k, 10, curses.A_DIM)
+                self._put(win, 1 + i, 12, g, 1, ga)
+                self._put(win, 1 + i, 14, note, bw - 16)
             else:
-                win.addnstr(1 + i, 2, "%-10s %s" % (k, v), bw - 4)
-        win.addnstr(bh - 2, 2, "any key to close", bw - 4, curses.A_DIM)
+                self._put(win, 1 + i, 2, "%-10s %s" % (k, v), bw - 4)
+        self._put(win, bh - 2, 2, "any key to close", bw - 4, curses.A_DIM)
         win.refresh()
         win.getch()
         self.msg = "%s: reasoning=%s vision=%s avail=%s" % (
@@ -1038,9 +1091,9 @@ class Tui:
         win = curses.newwin(bh, bw, top, left)
         round_box(win, " keys ")
         for i, (scope, txt) in enumerate(rows):
-            win.addnstr(1 + i, 2, "%-6s" % scope, 6, curses.A_DIM)
-            win.addnstr(1 + i, 8, txt, bw - 10)
-        win.addnstr(bh - 2, 2, "any key to close", bw - 4, curses.A_DIM)
+            self._put(win, 1 + i, 2, "%-6s" % scope, 6, curses.A_DIM)
+            self._put(win, 1 + i, 8, txt, bw - 10)
+        self._put(win, bh - 2, 2, "any key to close", bw - 4, curses.A_DIM)
         win.refresh()
         win.getch()
 
@@ -1071,11 +1124,11 @@ class Tui:
                 else:
                     shown, attr = txt, self.cl["sel"] if i == sel else curses.A_NORMAL
                 try:
-                    win.addnstr(1 + i, 2, " %-*s" % (bw - 4, shown), bw - 4, attr)
+                    self._put(win, 1 + i, 2, " %-*s" % (bw - 4, shown), bw - 4, attr)
                 except curses.error:
                     pass
             try:
-                win.addnstr(bh - 2, 2, footer, bw - 4, curses.A_DIM)
+                self._put(win, bh - 2, 2, footer, bw - 4, curses.A_DIM)
             except curses.error:
                 pass
             win.refresh()
@@ -1145,12 +1198,12 @@ class Tui:
                 txt, _val = view[top + i]
                 attr = self.cl["sel"] if top + i == sel else curses.A_NORMAL
                 try:
-                    win.addnstr(1 + i, 2, " %-*s" % (bw - 4, txt), bw - 4, attr)
+                    self._put(win, 1 + i, 2, " %-*s" % (bw - 4, txt), bw - 4, attr)
                 except curses.error:
                     pass
             try:
-                win.addnstr(bh - 3, 2, "filter: %s" % buf, bw - 4, curses.A_BOLD)
-                win.addnstr(bh - 2, 2, "filter · move · pick · bksp back · esc",
+                self._put(win, bh - 3, 2, "filter: %s" % buf, bw - 4, curses.A_BOLD)
+                self._put(win, bh - 2, 2, "filter · move · pick · bksp back · esc",
                             bw - 4, curses.A_DIM)
             except curses.error:
                 pass
@@ -1281,12 +1334,12 @@ class Tui:
         round_box(win, " usage ")
         for i, (k, v) in enumerate(flat):
             try:
-                win.addnstr(1 + i, 2, "%-10s %s" % (k, v), bw - 4,
+                self._put(win, 1 + i, 2, "%-10s %s" % (k, v), bw - 4,
                             curses.A_DIM if not k else curses.A_NORMAL)
             except curses.error:
                 pass
         try:
-            win.addnstr(bh - 2, 2, "backspace back · any key closes", bw - 4,
+            self._put(win, bh - 2, 2, "backspace back · any key closes", bw - 4,
                         curses.A_DIM)
         except curses.error:
             pass
